@@ -226,3 +226,61 @@ def test_group_context_model_roundtrip() -> None:
         messages=[GroupContextMessage(sender_id="ou_2", text="背景")],
     )
     assert GroupContext.model_validate_json(ctx.model_dump_json()) == ctx
+
+def test_jsonable_metadata_drops_objects_and_keeps_scalars() -> None:
+    from im_gateway.core.contracts import jsonable_metadata
+
+    marker = object()
+    cleaned = jsonable_metadata(
+        {
+            "message_id": "om_1",
+            "_frame": marker,
+            "count": 3,
+            "ratio": 0.5,
+            "flag": True,
+            "none": None,
+            "nested": {"keep": "v", "drop": marker},
+            "items": [1, marker, "x", {"deep": marker, "ok": 2}],
+            "tuple": (1, marker),
+        }
+    )
+    assert cleaned == {
+        "message_id": "om_1",
+        "count": 3,
+        "ratio": 0.5,
+        "flag": True,
+        "none": None,
+        "nested": {"keep": "v"},
+        "items": [1, "x", {"ok": 2}],
+        "tuple": [1],
+    }
+
+
+def test_start_frame_with_sdk_metadata_is_serializable() -> None:
+    import json
+
+    from octop_gateway.models import ChannelSubject, InboundMessage
+    from octop_gateway.models import TextContent as UpstreamText
+
+    from im_gateway.core.capabilities import capabilities_for
+    from im_gateway.core.contracts import jsonable_metadata, start_from_inbound
+
+    message = InboundMessage(
+        channel_id="wecom:acme:cs",
+        channel_type="wecom",
+        tenant_id="acme",
+        channel_subject=ChannelSubject(subject_id="user_1", chat_type="direct"),
+        content=[UpstreamText(text="hi")],
+        metadata={"msg_id": "m1", "_frame": object(), "_ws_client": object()},
+    )
+    frame = start_from_inbound(
+        message,
+        session_key="user_1",
+        idempotency_key="wecom:acme:cs:m1",
+        deadline_ms=1000,
+        capabilities=capabilities_for("wecom"),
+        turn_id="t1",
+    )
+    body = frame.model_dump_json()
+    assert json.loads(body)["metadata"] == {"msg_id": "m1"}
+    assert jsonable_metadata(message.metadata) == {"msg_id": "m1"}

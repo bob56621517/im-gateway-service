@@ -844,7 +844,8 @@ CLI ──HTTP──▶ daemon：校验 → 事务写 SQLite → 应用到 manag
 | 命令 | 作用 | 调控制面 | 触碰状态 / 上游 |
 |---|---|---|---|
 | `imgw run` | **唯一启动进程**：迁移 → 读 DB → reconcile channels → 起 uvicorn | 无（进程本身） | 全量 |
-| `imgw install-service` / `uninstall-service` | 生成 systemd / launchd / NSSM 配置 | 无 | 服务配置文件 |
+| `imgw install-service [--dry-run] [--print-only] [--user/--system] [--workdir]` | 生成并安装 systemd / launchd / NSSM 定义（`--print-only` 只打印，`--dry-run` 不写不执行） | 无 | 服务定义文件 + 系统命令 |
+| `imgw uninstall-service` / `start [--wait]` / `stop` / `restart` | 生命周期转发给系统服务管理器；`start --wait` 轮询 `/readyz` | `GET /readyz`（仅 `--wait`） | 系统服务 |
 | `imgw start [--wait]` / `stop` / `restart` | 转发给系统服务管理器；`--wait` 轮询 `/readyz` | `GET /readyz` | 系统服务 |
 | `imgw status [--json]` | 守护进程 + 每通道状态 | `GET /v1/status` | 内存 + DB |
 | `imgw channel ls` | 列通道（id/alias/kind/tenant/enabled/created_at） | `GET /v1/channels` | DB |
@@ -869,7 +870,7 @@ CLI ──HTTP──▶ daemon：校验 → 事务写 SQLite → 应用到 manag
 
 1. **SQLite 是唯一权威；daemon 是唯一在线写者；CLI 是唯一修改入口**（离线模式 CLI 独占写 DB，属受控例外）。
 2. **没有 `sync`、没有配置文件 watch、没有 reconcile 引擎**：改与生效同一次调用。
-3. **只有 `imgw run` 启动进程**；`install-service` 只写服务配置；其余命令是 HTTP 客户端（离线模式除外）。
+3. **只有 `imgw run` 启动进程**；`install-service` 只生成/安装系统服务定义（会 `enable --now` 交给系统服务管理器拉起 `imgw run`）；其余命令是 HTTP 客户端（离线模式除外）。
 4. `channel add --check` / `channel test` 走 `probe_channel`，避免坏凭证注册出半死通道。
 5. `enable/disable` 保留配置与数据；`rm --purge` 才级联清理。
 6. `send` 必须带 `Idempotency-Key`；失败进审计/重试，但**不自动重试 turn**。
@@ -952,47 +953,70 @@ CLI ──HTTP──▶ daemon：校验 → 事务写 SQLite → 应用到 manag
 
 ---
 
-## 15. 实施状态（milestone 1，2026-11-09）
+## 15. 实施状态（2026-11-09：离线可完成部分全部完成）
 
-### 15.1 已完成
+> 验收口径：**只认单元测试**（`uv run pytest`），不把冒烟测试当作验收依据。
+> 所有测试均为离线测试：`httpx.MockTransport` 假后端、fake manager/runner/QR adapter、`TestClient`；不连接任何真实平台、不启动 systemd、不发真实网络请求。
 
-| 模块 | 内容 | 测试 |
-|---|---|---|
-| `pyproject.toml` | uv + hatchling；pin `octop-gateway==1.0.3`；pytest/ruff/mypy 配置 | — |
-| `core/contracts.py` | `TurnFrame` + 11 种 `FrameKind` + 逐帧必填校验 + 上游 `InboundMessage`/`MessageEvent` 互转；线上模型不依赖上游枚举 | 25 |
-| `core/config.py` | `ConfigDocument`（export/import 的可移植 JSON 形式）+ 引用校验 | 7 |
-| `core/capabilities.py` | 10 个通道 kind 的 capability 表（§12.7 的初始值，待实测校准） | 1 |
-| `core/paths.py` | bootstrap 三项路径 + token 文件（0600） | 6 |
-| `db/` | 9 张表（§13.2）+ `Store`（短连接、线程安全、`prune` 分批、`VACUUM INTO` 备份）+ 迁移 | 27 |
-| `gateway/` | `create_app`/`run_daemon`；`GatewayRuntime` 接 `ChannelManager`；per-kind config（weixin 特判）；SSE 事件总线；全部 §13.6 路由 | 36 |
-| `cli/` | 15 个 typer 命令 + httpx 客户端（UDS/TCP、token）+ segno 二维码；不 import 通道栈 | 55 |
+### 15.1 完成清单
 
-**门禁**：`uv run pytest -q` → **157 passed**；`uv run ruff check src tests` → 干净；`uv run mypy`（strict）→ 干净。
-**真实 daemon 冒烟**：`imgw run`（TCP）→ `/healthz` `/readyz` → `status` / `channel add` / `config export|import` / `restart`（DB 与迁移幂等）/ `channel rm`；401 鉴权生效；中文经 API 往返正常（控制台显示乱码仅为 Windows 控制台编码）。
+| 模块 | 内容 |
+|---|---|
+| 工程 | `pyproject.toml`（uv + hatchling，pin `octop-gateway==1.0.3`，pytest/ruff/mypy/pytest-cov 配置） |
+| `core/` | `contracts.py`（`TurnFrame` 11 种帧 + 逐帧校验 + 上游互转 + metadata JSON 清洗）、`config.py`（`ConfigDocument`）、`capabilities.py`（10 通道初始 capability 表）、`paths.py`（bootstrap 三项 + 0600 token） |
+| `db/` | 9 张表（§13.2）+ `Store`（短连接/线程安全、迁移、分批 prune、`VACUUM INTO` 备份、幂等 claim） |
+| `gateway/` | `app.py`（§13.6 全部路由 + 鉴权 + 错误映射 + SSE）、`runtime.py`（Store↔ChannelManager 接线、状态机、config import、优雅停机）、`factory.py`（per-kind config，weixin 特判）、`events.py`（进程内 SSE 总线）、`processor.py`（**模型 A 实现**）、`idempotency.py`（8 通道 msg id 提取 + hash 兜底）、`maintenance.py`（retention 调度）、`login.py`（扫码登录状态机 + QQ/微信 adapter）、`dev_processor.py`（echo 占位，仅测试/自检用） |
+| `cli/` | 16 个命令（新增 `channel login`），httpx 客户端（UDS/TCP、token、SSE）、segno 二维码；`service.py`（systemd/launchd/NSSM 生成 + 生命周期命令） |
+| 文档 | `README.md`、本文件 §12~§15 |
 
-### 15.2 已知占位 / milestone 2 待办
+### 15.2 已接通的关键行为（都有单测钉住）
 
-1. **真实 processor**（模型 A）：当前 `dev_processor.echo_processor` 只回显；需实现 POST `/v1/turns` + SSE 帧→`MessageEvent` + 幂等（`inbound_dedup`）+ subjects upsert + messages 落库。
-2. **backend 配置只存不用**：`backends` 表与 runtime 路由已就位，等 processor 消费。
-3. **扫码登录**（`/v1/channels/{ref}/login`、`imgw channel login`）未实现。
-4. **service 命令**（`install-service` / `start` / `stop` / `restart`）为 milestone-2 占位（exit 2 + 提示）。
-5. **retention 后台调度**：`prune` 目前只能手动 `POST /v1/db/maintenance`；需要在 lifespan 里加每日任务 + 启动补跑。
-6. **outbox / 推送重试**：`/v1/messages` 目前 best-effort。
-7. **capability 表逐通道实测校准**（§12.7 的初始值未经真机验证）。
-8. `imgw doctor` 的 backend 可达性检查、`/v1/events` 仅通道状态事件（还没有入站/出站事件）。
+1. **模型 A processor**：幂等 claim → 入站消息落库 → `subjects` upsert（过滤临时字段）→ 按 tenant 选后端（`${ENV}` 展开）→ 构造 `start` 帧（含 capability）→ SSE 逐帧解析 + `seq` 严格 +1 校验 → 转 `MessageEvent`；**恰好一个终止事件**；所有异常在流内转成中文 `ERROR`，`CancelledError` 透传；上游 `aclose` 早停时 HTTP client 确定性关闭。
+2. **metadata 清洗**：WeCom 等适配器会把 live SDK 对象（`_frame` / `_ws_client`）放进 `InboundMessage.metadata`；网关在写 wire body 与 SQLite 前统一剔除，避免正常消息退化成内部错误（回归测试见 `tests/test_processor.py` + `tests/test_contracts.py`）。
+3. **落库**：入站一条 + 出站最终内容一条（DELTA 合并，不落 token 碎片）；`subjects` 每条入站刷新；`inbound_dedup` 拦截平台重投；`audit` 记录管理动作。
+4. **优雅停机**：`settings.shutdown_grace_ms`（默认 10s）内等待 `active_turns` 归零，再 `manager.stop()`。
+5. **retention**：启动补跑 + 每日循环；`settings.retention` 覆盖默认；单次失败不杀循环。
+6. **扫码登录**：内存会话状态机（pending/scanned/confirmed/expired/取消，TTL）+ QQ/微信 adapter（可注入 fake；真实 adapter 懒加载上游类）+ 凭证合并写回 channel config（weixin accounts 按 `account_id` 合并）+ 审计 + 事件发布。
+7. **系统服务**：生成 systemd unit / launchd plist / NSSM 命令；`install-service`（默认用户级，`--system` 需 root；`--print-only` 只打印；`--dry-run` 不写不执行）、`uninstall-service`、`start --wait`（轮询 `/readyz`）、`stop`、`restart`；runner 可注入，失败统一 `ServiceError` → exit 1。
 
-### 15.3 与设计文档的实现偏差（已确认可接受）
+### 15.3 未完成（依赖真实平台/外部环境，需要真机验证）
 
-1. `config import` 是**一次性批量应用**（先全量校验再写库），不是常驻 reconcile 循环——符合 §13.8 第 8 条「导入是单事务」。
-2. `POST /v1/messages` 的幂等键在发送**前** claim，发送失败不释放（Store 无 unclaim）；CLI 每次生成新 uuid，不受影响。outbox 上线时一并修。
-3. `readyz` 只检查 enabled 通道 `state == running`，不检查上游 `connected`（上游无统一状态 API，§11.2 #5）。
-4. Windows 上 `uv` 解析到的运行时是 **Python 3.12**（uv-managed），与上游 CI 对齐，而非系统 3.14。
-5. `POST /v1/channels` 返回 200（不是 201）；CLI 不关心状态码语义。
+1. QQ / 微信扫码的真实上游网络调用与真实凭证落地（adapter 与状态机已测，真实平台流程未跑）。
+2. 10 个通道的真实连接与收发（需要真实凭证与网络）。
+3. capability 表逐通道真机校准（§12.7 的初始值未经实测）。
+4. outbox / 推送重试与 delivery 状态（需要真实通道的失败语义验证）。
+5. `imgw doctor` 的 backend 可达性检查（需要真实后端服务）。
+6. 多节点 seam 实现（v2）；CLA/DCO、协调层选型等未决项（§14.4）。
+7. 登录会话是进程内存态：daemon 重启后未完成的扫码会话丢失（重新 `imgw channel login`）。
 
-### 15.4 下一步顺序（milestone 2）
+### 15.4 测试与覆盖率
 
-1. `gateway/processor.py`：模型 A（start 帧构造 → httpx SSE → `MessageEvent`；恰好一个终止帧；中文错误文案）。
-2. 假后端（回显 SSE）+ 一条端到端：入站 → processor → 出站。
-3. `subjects`/`inbound_dedup`/`messages` 在 processor 内落库；`config import` 的 `backends` 接入路由。
-4. retention 每日调度 + outbox。
-5. 飞书单通道真机端到端（再企微），逐通道校准 capability。
+```
+uv run pytest -q                        436 passed
+uv run ruff check src tests             All checks passed
+uv run mypy                             Success: no issues found (25 source files, strict)
+uv run pytest --cov=im_gateway           TOTAL 2984 stmts, 10 miss, 99%+
+```
+
+100% 覆盖的模块：`core/config`、`core/project paths`、`db/models`、`db/schema`、`gateway/app`、`gateway/runtime`、`gateway/events`、`gateway/factory`、`gateway/idempotency`、`cli/client`、`cli/main`、`cli/qr`。
+剩余未覆盖行全部是平台分支或并发竞态防御（Windows/POSIX 另一侧、SQLite 唯一约束竞态、`# pragma: no cover` 的不可达兜底），不包含业务逻辑。
+
+> 冒烟记录（仅供参考，不作为验收）：真实 daemon 曾跑通 `imgw run` → `/healthz` `/readyz` → `status` / `channel add` / `config export|import` / 重启（迁移幂等）/ `channel rm`。
+
+### 15.5 与设计文档的实现偏差（已确认可接受）
+
+1. `config import` 是一次性批量应用（先全量校验再写库），不是常驻 reconcile。
+2. `POST /v1/messages` 幂等键在发送**前** claim，发送失败不释放；CLI 每次生成新 key，不受影响（outbox 时一并修）。
+3. `readyz` 只检查 enabled 通道 `state == running`，不检查上游 `connected`（上游无统一状态 API）。
+4. Windows 上 `uv` 解析到的运行时是 **Python 3.12**（uv-managed），与上游 CI 对齐。
+5. `POST /v1/channels` 返回 200（不是 201）。
+6. `install-service` 会执行 `systemctl enable --now`（即顺带启动服务），不再只是写文件；`--print-only` 才是纯生成。
+7. `start/stop/restart/uninstall-service` 默认用户级（`--user`），`--system` 需要 root。
+8. `imgw channel login` 的二维码由 CLI 渲染（`qr_content`）或打印图片 URL（`qr_image_url`），网关只返回挑战内容。
+
+### 15.6 下一步（需要真实环境）
+
+1. 飞书单通道真机端到端：扫码/凭据 → 私聊 + 群聊 → 流式回复 → 主动推送；据此校准 capability。
+2. 企微（原生流 + 10s 占位）与 QQ；再 weixin（会话过期重扫码）。
+3. outbox / delivery 状态 / backend 可达性 doctor。
+4. 双模式 CI 占位（1 节点 SQLite / 3 节点 PG+Redis），为 v2 留出测试结构。

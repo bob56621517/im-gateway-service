@@ -17,6 +17,7 @@ platform SDK.
 from __future__ import annotations
 
 import time
+from collections.abc import Mapping
 from enum import StrEnum
 from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
 
@@ -43,6 +44,7 @@ __all__ = [
     "TurnFrame",
     "VideoContent",
     "frame_to_message_event",
+    "jsonable_metadata",
     "start_from_inbound",
 ]
 
@@ -318,6 +320,41 @@ def frame_to_message_event(frame: TurnFrame) -> MessageEvent:
     return frame.to_message_event()
 
 
+_DROP = object()
+
+
+def _jsonable(value: Any) -> Any:
+    """Recursively keep JSON-representable values, drop everything else."""
+    if value is None or isinstance(value, str | bool | int | float):
+        return value
+    if isinstance(value, dict):
+        cleaned = {str(key): _jsonable(item) for key, item in value.items()}
+        return {key: item for key, item in cleaned.items() if item is not _DROP}
+    if isinstance(value, list | tuple):
+        items = [_jsonable(item) for item in value]
+        return [item for item in items if item is not _DROP]
+    return _DROP
+
+
+def jsonable_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Copy *metadata*, dropping values that cannot be represented as JSON.
+
+    Platform adapters put live SDK objects into ``InboundMessage.metadata``
+    (e.g. WeCom's ``_frame`` / ``_ws_client``, see octop-gateway
+    ``channels/wecom.py``). Passing those into the wire body or SQLite would
+    fail serialisation and turn a normal message into an internal error, so the
+    gateway sanitises them at the boundary (HANDOVER §11.2 #12).
+    """
+    if not metadata:
+        return {}
+    result: dict[str, Any] = {}
+    for key, value in metadata.items():
+        cleaned = _jsonable(value)
+        if cleaned is not _DROP:
+            result[str(key)] = cleaned
+    return result
+
+
 def start_from_inbound(
     message: InboundMessage,
     *,
@@ -357,7 +394,7 @@ def start_from_inbound(
         idempotency_key=idempotency_key,
         deadline_ms=deadline_ms,
         content=[_content_from_upstream(part) for part in message.content],
-        metadata=dict(message.metadata or {}),
+        metadata=jsonable_metadata(message.metadata),
         timestamp=message.timestamp,
         capabilities=capabilities,
         group_context=group_context,

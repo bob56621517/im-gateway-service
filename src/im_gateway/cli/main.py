@@ -11,8 +11,11 @@ Hard rule: this module must not import ``im_gateway.gateway.*`` or
 
 from __future__ import annotations
 
+import contextlib
 import functools
+import getpass
 import json
+import os
 import sys
 import time
 import uuid
@@ -27,15 +30,19 @@ import typer
 
 from im_gateway.cli import client as control_plane
 from im_gateway.cli.client import ControlPlaneError
+from im_gateway.cli.service import (
+    ServiceController,
+    ServiceError,
+    ServiceSpec,
+    default_exec_path,
+    default_target,
+    render_command,
+    render_service_file,
+    service_file_path,
+)
 from im_gateway.core.config import ChannelConfigEntry, ConfigDocument
 
 __all__ = ["app", "main"]
-
-#: Shown by commands that are stubs until milestone 2.
-MILESTONE_2_NOTE = (
-    "not implemented in milestone 1; run the daemon in the foreground with "
-    "`imgw run` (service management lands in milestone 2)"
-)
 
 CHANNEL_TABLE_HEADERS = ["CHANNEL_ID", "KIND", "TENANT", "ALIAS", "ENABLED", "STATE", "NAME"]
 HISTORY_TABLE_HEADERS = ["TS", "CHANNEL_ID", "SUBJECT_ID", "DIR", "KIND", "TEXT"]
@@ -154,6 +161,20 @@ def _handle_errors(func: Callable[..., Any]) -> Callable[..., Any]:
         try:
             return func(*args, **kwargs)
         except ControlPlaneError as exc:
+            typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
+            raise typer.Exit(1) from None
+
+    return wrapper
+
+
+def _handle_service_errors(func: Callable[..., Any]) -> Callable[..., Any]:
+    """Print :class:`ServiceError` as ``error: ...`` and exit with code 1."""
+
+    @functools.wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        try:
+            return func(*args, **kwargs)
+        except ServiceError as exc:
             typer.secho(f"error: {exc}", fg=typer.colors.RED, err=True)
             raise typer.Exit(1) from None
 
@@ -283,9 +304,78 @@ def _parse_config_value(raw: str) -> Any:
         return raw
 
 
-def _milestone_2(command: str) -> None:
-    typer.secho(f"error: `imgw {command}` is {MILESTONE_2_NOTE}", fg=typer.colors.YELLOW, err=True)
-    raise typer.Exit(2)
+# ---------------------------------------------------------------------------
+# System service helpers (`imgw install-service` / `start` / `stop` / `restart`)
+# ---------------------------------------------------------------------------
+
+
+def _service_platform() -> str:
+    """Platform seam for the service commands (tests monkeypatch it)."""
+    return sys.platform
+
+
+def _current_username() -> str:
+    try:
+        return getpass.getuser()
+    except (ImportError, KeyError, OSError):
+        return os.environ.get("USER") or os.environ.get("USERNAME") or "imgw"
+
+
+def _service_spec(*, workdir: str | None, user_scope: bool) -> ServiceSpec:
+    """Build the default spec from the current interpreter / cwd and CLI options."""
+    workdir_path = Path(workdir).expanduser() if workdir else Path.cwd()
+    return ServiceSpec(
+        exec_path=default_exec_path(),
+        workdir=str(workdir_path.resolve()),
+        user=None if user_scope else _current_username(),
+    )
+
+
+def _emit_service_result(
+    ctx: typer.Context,
+    commands: list[list[str]],
+    *,
+    service_file: Path | None = None,
+    dry_run: bool = False,
+    json_output: bool = False,
+) -> None:
+    """Print the command sequence (human ``$ ...`` lines or JSON) and its outcome."""
+    if _want_json(ctx, json_output):
+        _print_json(
+            {
+                "dry_run": dry_run,
+                "service_file": str(service_file) if service_file is not None else None,
+                "commands": commands,
+            }
+        )
+        return
+    for command in commands:
+        typer.echo(f"$ {render_command(command)}")
+    if dry_run:
+        typer.echo("(dry run: nothing was written or executed)")
+        return
+    if service_file is not None:
+        typer.echo(f"service definition: {service_file}")
+    typer.echo(f"ok: {len(commands)} command(s) executed")
+
+
+def _wait_ready(ctx: typer.Context, *, timeout_s: float = 30.0) -> None:
+    """Poll ``/readyz`` after ``imgw start --wait`` (HANDOVER §13.7)."""
+    options = _options(ctx)
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            with get_client(options.url, options.token) as client:
+                control_plane.api(client, "GET", "/readyz")
+        except ControlPlaneError as exc:
+            if time.monotonic() >= deadline:
+                raise ServiceError(
+                    f"the daemon did not become ready within {timeout_s:.0f}s: {exc}"
+                ) from exc
+            time.sleep(0.5)
+        else:
+            typer.echo("ready: the daemon answered /readyz")
+            return
 
 
 # ---------------------------------------------------------------------------
@@ -585,37 +675,169 @@ def run(
 
 
 @app.command("install-service")
-def install_service() -> None:
-    """Install a system service definition (milestone 2)."""
-    # TODO(milestone-2): generate + install systemd / launchd / NSSM definitions.
-    _milestone_2("install-service")
+@_handle_service_errors
+def install_service(
+    ctx: typer.Context,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Print the commands without writing files or running them."),
+    ] = False,
+    user_scope: Annotated[
+        bool,
+        typer.Option(
+            "--user/--system",
+            help="Install a user-scoped service (default, no root) or a system-wide one (needs root).",
+        ),
+    ] = True,
+    workdir: Annotated[
+        str | None,
+        typer.Option("--workdir", help="Working directory of the daemon (default: the current directory)."),
+    ] = None,
+    print_only: Annotated[
+        bool,
+        typer.Option(
+            "--print-only",
+            help="Print the generated definition without writing or executing anything.",
+        ),
+    ] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit JSON instead of human-readable output."),
+    ] = False,
+) -> None:
+    """Generate and install the platform service definition (systemd / launchd / NSSM)."""
+    platform = _service_platform()
+    spec = _service_spec(workdir=workdir, user_scope=user_scope)
+    target = default_target(platform=platform, spec=spec)
+
+    if print_only:
+        typer.echo(render_service_file(spec, platform=platform, target=target), nl=False)
+        return
+
+    commands = ServiceController(platform=platform, spec=spec).install(target=target, dry_run=dry_run)
+    service_file = None if dry_run else service_file_path(platform=platform, target=target)
+    _emit_service_result(
+        ctx,
+        commands,
+        service_file=service_file,
+        dry_run=dry_run,
+        json_output=json_output,
+    )
+
+
+@app.command("uninstall-service")
+@_handle_service_errors
+def uninstall_service(
+    ctx: typer.Context,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Print the commands without executing them."),
+    ] = False,
+    user_scope: Annotated[
+        bool,
+        typer.Option(
+            "--user/--system",
+            help="Manage the user-scoped service (default) or the system-wide one.",
+        ),
+    ] = True,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit JSON instead of human-readable output."),
+    ] = False,
+) -> None:
+    """Stop and remove the platform service definition."""
+    platform = _service_platform()
+    spec = _service_spec(workdir=None, user_scope=user_scope)
+    target = default_target(platform=platform, spec=spec)
+    commands = ServiceController(platform=platform, spec=spec).uninstall(target=target, dry_run=dry_run)
+    _emit_service_result(ctx, commands, dry_run=dry_run, json_output=json_output)
 
 
 @app.command("start")
+@_handle_service_errors
 def start(
+    ctx: typer.Context,
     wait: Annotated[
         bool,
-        typer.Option("--wait", help="Poll /readyz until the daemon is ready (milestone 2)."),
+        typer.Option("--wait", help="Poll /readyz until the daemon is ready."),
+    ] = False,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Print the commands without executing them."),
+    ] = False,
+    user_scope: Annotated[
+        bool,
+        typer.Option(
+            "--user/--system",
+            help="Manage the user-scoped service (default) or the system-wide one.",
+        ),
+    ] = True,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit JSON instead of human-readable output."),
     ] = False,
 ) -> None:
-    """Start the system service (milestone 2)."""
-    # TODO(milestone-2): forward to systemctl / launchctl / NSSM and honour --wait.
-    _ = wait
-    _milestone_2("start")
+    """Start the system service."""
+    platform = _service_platform()
+    spec = _service_spec(workdir=None, user_scope=user_scope)
+    commands = ServiceController(platform=platform, spec=spec).start(dry_run=dry_run)
+    _emit_service_result(ctx, commands, dry_run=dry_run, json_output=json_output)
+    if wait and not dry_run:
+        _wait_ready(ctx)
 
 
 @app.command("stop")
-def stop() -> None:
-    """Stop the system service (milestone 2)."""
-    # TODO(milestone-2): forward to the platform service manager.
-    _milestone_2("stop")
+@_handle_service_errors
+def stop(
+    ctx: typer.Context,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Print the commands without executing them."),
+    ] = False,
+    user_scope: Annotated[
+        bool,
+        typer.Option(
+            "--user/--system",
+            help="Manage the user-scoped service (default) or the system-wide one.",
+        ),
+    ] = True,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit JSON instead of human-readable output."),
+    ] = False,
+) -> None:
+    """Stop the system service."""
+    platform = _service_platform()
+    spec = _service_spec(workdir=None, user_scope=user_scope)
+    commands = ServiceController(platform=platform, spec=spec).stop(dry_run=dry_run)
+    _emit_service_result(ctx, commands, dry_run=dry_run, json_output=json_output)
 
 
 @app.command("restart")
-def restart() -> None:
-    """Restart the system service (milestone 2)."""
-    # TODO(milestone-2): forward to the platform service manager.
-    _milestone_2("restart")
+@_handle_service_errors
+def restart(
+    ctx: typer.Context,
+    dry_run: Annotated[
+        bool,
+        typer.Option("--dry-run", help="Print the commands without executing them."),
+    ] = False,
+    user_scope: Annotated[
+        bool,
+        typer.Option(
+            "--user/--system",
+            help="Manage the user-scoped service (default) or the system-wide one.",
+        ),
+    ] = True,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help="Emit JSON instead of human-readable output."),
+    ] = False,
+) -> None:
+    """Restart the system service."""
+    platform = _service_platform()
+    spec = _service_spec(workdir=None, user_scope=user_scope)
+    commands = ServiceController(platform=platform, spec=spec).restart(dry_run=dry_run)
+    _emit_service_result(ctx, commands, dry_run=dry_run, json_output=json_output)
 
 
 # ---------------------------------------------------------------------------
@@ -829,6 +1051,85 @@ def channel_test(
         _print_json(payload)
         return
     typer.echo(f"probe ok: {kind}")
+
+
+@channel_app.command("login")
+@_handle_errors
+def channel_login(
+    ctx: typer.Context,
+    ref: Annotated[str, typer.Argument(help="channel_id or alias.")],
+    timeout: Annotated[
+        float, typer.Option("--timeout", help="Overall wait for confirmation (seconds).")
+    ] = 300.0,
+    interval: Annotated[float, typer.Option("--interval", help="Poll interval (seconds).")] = 2.0,
+) -> None:
+    """QR login for QQ / Weixin channels; renders the QR in the terminal."""
+    options = _options(ctx)
+    if timeout <= 0:
+        typer.secho("error: --timeout must be positive", fg=typer.colors.RED, err=True)
+        raise typer.Exit(1)
+    wait_s = max(0.1, interval)
+    deadline = time.monotonic() + timeout
+    json_mode = _want_json(ctx)
+    path = f"/v1/channels/{_ref_path(ref)}/login"
+
+    with get_client(options.url, options.token) as client:
+        challenge = control_plane.api(client, "POST", path)
+        session_id = str(challenge.get("session_id") or "")
+        if json_mode:
+            _print_json(challenge)
+        else:
+            _render_login_qr(challenge)
+
+        result = challenge
+        status = str(challenge.get("status") or "pending")
+        while status in {"pending", "scanned"} and time.monotonic() < deadline:
+            time.sleep(wait_s)
+            result = control_plane.api(client, "GET", f"{path}/{session_id}")
+            next_status = str(result.get("status") or status)
+            if not json_mode and next_status != status:
+                typer.echo(f"status: {next_status}")
+            status = next_status
+
+        if status in {"confirmed", "success"}:
+            if json_mode:
+                _print_json(result)
+            else:
+                typer.echo(f"login confirmed: {ref}")
+            return
+        if status in {"pending", "scanned"}:
+            # Timed out: best-effort cancel so the daemon stops the upstream QR task.
+            with contextlib.suppress(ControlPlaneError):
+                control_plane.api(client, "DELETE", f"{path}/{session_id}")
+            typer.secho(f"error: login timed out after {timeout:g}s", fg=typer.colors.RED, err=True)
+            raise typer.Exit(1)
+
+        if json_mode:
+            _print_json(result)
+        else:
+            message = str(result.get("message") or "")
+            typer.secho(
+                f"error: login {status}" + (f": {message}" if message else ""),
+                fg=typer.colors.RED,
+                err=True,
+            )
+        raise typer.Exit(1)
+
+
+def _render_login_qr(challenge: dict[str, Any]) -> None:
+    """Render the QR challenge: encode text locally, or print the image URL."""
+    content = str(challenge.get("qr_content") or "")
+    image_url = str(challenge.get("qr_image_url") or "")
+    if content:
+        from im_gateway.cli.qr import render_qr
+
+        typer.echo(render_qr(content))
+        return
+    if image_url:
+        typer.echo(f"QR image: {image_url}")
+        return
+    typer.secho("error: 后端未返回二维码内容", fg=typer.colors.RED, err=True)
+    raise typer.Exit(1)
 
 
 # ---------------------------------------------------------------------------

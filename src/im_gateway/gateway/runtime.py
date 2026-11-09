@@ -35,9 +35,9 @@ from im_gateway.core.config import (
 )
 from im_gateway.db.models import BackendRecord, ChannelRecord, MessageRecord
 from im_gateway.db.store import Store
-from im_gateway.gateway.dev_processor import echo_processor
 from im_gateway.gateway.events import EventBus
 from im_gateway.gateway.factory import build_config, constraints_of
+from im_gateway.gateway.processor import build_processor
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from octop_gateway.channel import MessageProcessor
@@ -52,6 +52,8 @@ STATE_ERROR: Final[str] = "error"
 
 _DEFAULT_WORKERS: Final[int] = 4
 _DEFAULT_QUEUE_MAXSIZE: Final[int] = 1000
+#: How long shutdown waits for in-flight turns before cancelling workers.
+_DEFAULT_SHUTDOWN_GRACE_MS: Final[int] = 10_000
 #: Audit rows written by the control plane through its own bearer token.
 _ACTOR: Final[str] = "api-token"
 #: Fields accepted by :meth:`GatewayRuntime.update_channel`.
@@ -158,10 +160,13 @@ class GatewayRuntime:
         self.last_config_warnings: list[str] = []
 
         self._manager = manager
-        self._processor = processor or echo_processor
+        #: Built in :meth:`start` when not injected: ``build_processor`` reads
+        #: settings, and the database has not necessarily been migrated yet.
+        self._processor = processor
         self._registered: set[str] = set()
         self._states: dict[str, tuple[str, str | None]] = {}
         self._started = False
+        self._stopping = False
         self._started_at: float | None = None
 
     # -- introspection ---------------------------------------------------------
@@ -170,6 +175,11 @@ class GatewayRuntime:
     def manager(self) -> Any | None:
         """The upstream manager (``None`` until :meth:`start` builds one)."""
         return self._manager
+
+    @property
+    def processor(self) -> Any:
+        """The ``MessageProcessor`` in use (built during :meth:`start` if absent)."""
+        return self._processor
 
     @property
     def media_dir_path(self) -> Path:
@@ -203,6 +213,9 @@ class GatewayRuntime:
         self.store.migrate()
         self._started_at = time.time()
         self.events.bind_loop(asyncio.get_running_loop())
+        if self._processor is None:
+            # Reads settings -> must happen after migrate().
+            self._processor = build_processor(self.store, events=self.events)
         if self._manager is None:
             self._manager = self._build_manager()
         self._started = True
@@ -219,15 +232,54 @@ class GatewayRuntime:
                 self._set_state(record.channel_id, STATE_ERROR, str(exc))
 
     async def stop(self) -> None:
-        """Stop the manager and close the store (idempotent)."""
-        if self._manager is not None:
-            try:
-                await self._manager.stop()
-            except Exception:  # shutdown must continue even if one adapter hangs
-                logger.exception("failed to stop the channel manager")
-        self._registered.clear()
-        self.store.close()
-        self._started = False
+        """Drain in-flight turns, stop the manager and close the store.
+
+        ``ChannelManager.stop()`` cancels workers without a grace period
+        (HANDOVER §11.2 #7), so the runtime first waits for the processor's
+        active turns to finish (bounded by ``settings.shutdown_grace_ms``).
+        """
+        if self._stopping or not self._started:
+            return
+        self._stopping = True
+        try:
+            if self._manager is not None:
+                grace_ms = _positive_int(
+                    self.store.get_setting("shutdown_grace_ms", _DEFAULT_SHUTDOWN_GRACE_MS),
+                    _DEFAULT_SHUTDOWN_GRACE_MS,
+                )
+                idle = await self.wait_for_idle_turns(grace_ms / 1000)
+                if not idle:
+                    logger.warning(
+                        "shutdown grace expired with %d turn(s) still active",
+                        self.active_turns,
+                    )
+                try:
+                    await self._manager.stop()
+                except Exception:  # shutdown must continue even if one adapter hangs
+                    logger.exception("failed to stop the channel manager")
+            self._registered.clear()
+            self.store.close()
+            self._started = False
+        finally:
+            self._stopping = False
+
+    @property
+    def active_turns(self) -> int:
+        """Number of turns currently being processed by the processor."""
+        value = getattr(self._processor, "active_turns", 0)
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):  # pragma: no cover - defensive
+            return 0
+
+    async def wait_for_idle_turns(self, timeout_s: float, *, poll_s: float = 0.05) -> bool:
+        """Wait until no turn is active; ``False`` when the timeout expires."""
+        deadline = time.monotonic() + max(0.0, float(timeout_s))
+        while self.active_turns > 0:
+            if time.monotonic() >= deadline:
+                return False
+            await asyncio.sleep(poll_s)
+        return True
 
     def _build_manager(self) -> Any:
         """Build the real upstream manager (lazy imports keep CLI startup fast)."""

@@ -44,6 +44,8 @@ from im_gateway.core.config import (
 )
 from im_gateway.db.models import ChannelRecord, MessageRecord
 from im_gateway.db.store import Store
+from im_gateway.gateway.login import LoginManager
+from im_gateway.gateway.maintenance import RetentionScheduler
 from im_gateway.gateway.runtime import GatewayRuntime
 
 __all__ = ["create_app", "run_daemon"]
@@ -297,13 +299,18 @@ def create_app(
     which is how tests inject a fake upstream manager.
     """
     active_runtime = runtime if runtime is not None else GatewayRuntime(store, token=token, manager=manager)
+    scheduler = RetentionScheduler(store)
+    login_manager = LoginManager(active_runtime)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await active_runtime.start()
+        await scheduler.start()  # catch-up retention pass + daily loop
         try:
             yield
         finally:
+            await login_manager.close()
+            await scheduler.stop()
             await active_runtime.stop()
 
     app = FastAPI(
@@ -315,6 +322,8 @@ def create_app(
     app.state.runtime = active_runtime
     app.state.store = store
     app.state.token = token
+    app.state.scheduler = scheduler
+    app.state.login_manager = login_manager
 
     # -- auth --------------------------------------------------------------
     def _token_matches(provided: str) -> bool:
@@ -449,6 +458,19 @@ def create_app(
     @app.get("/v1/channels/{ref}/subjects")
     async def list_subjects(ref: str) -> dict[str, Any]:
         return {"subjects": active_runtime.list_subjects(ref)}
+
+    # -- QR login (QQ / Weixin; HANDOVER §13.7, §11.4) ------------------------
+    @app.post("/v1/channels/{ref}/login")
+    async def start_login(ref: str) -> dict[str, Any]:
+        return await login_manager.begin(ref)
+
+    @app.get("/v1/channels/{ref}/login/{session_id}")
+    async def poll_login(ref: str, session_id: str) -> dict[str, Any]:
+        return await login_manager.poll(ref, session_id)
+
+    @app.delete("/v1/channels/{ref}/login/{session_id}")
+    async def cancel_login(ref: str, session_id: str) -> dict[str, Any]:
+        return await login_manager.cancel(ref, session_id)
 
     # -- messages ------------------------------------------------------------
     @app.post("/v1/messages")

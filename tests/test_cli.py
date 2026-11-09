@@ -724,12 +724,36 @@ def test_unreachable_daemon_hints_imgw_run(monkeypatch: pytest.MonkeyPatch) -> N
     assert "imgw run" in result.stderr
 
 
-def test_milestone_2_commands_exit_two(backend: FakeBackend) -> None:
-    for command in ("install-service", "start", "stop", "restart"):
+def test_service_commands_delegate_to_controller(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class FakeServiceController:
+        def __init__(self, *, platform: str | None = None, spec: object = None) -> None:
+            self.platform = platform
+            self.spec = spec
+
+        def install(self, *, target: Path | None = None, dry_run: bool = False) -> list[list[str]]:
+            return [["systemctl", "--user", "daemon-reload"]]
+
+        def start(self, *, dry_run: bool = False) -> list[list[str]]:
+            return [["systemctl", "--user", "start", "im-gateway"]]
+
+        def stop(self, *, dry_run: bool = False) -> list[list[str]]:
+            return [["systemctl", "--user", "stop", "im-gateway"]]
+
+        def restart(self, *, dry_run: bool = False) -> list[list[str]]:
+            return [["systemctl", "--user", "restart", "im-gateway"]]
+
+    monkeypatch.setattr(cli, "ServiceController", FakeServiceController)
+    for command, expected in (
+        ("install-service", "systemctl --user daemon-reload"),
+        ("start", "systemctl --user start im-gateway"),
+        ("stop", "systemctl --user stop im-gateway"),
+        ("restart", "systemctl --user restart im-gateway"),
+    ):
         result = runner.invoke(cli.app, [command])
-        assert result.exit_code == 2, (command, result.stderr)
-        assert "milestone 2" in result.stderr
-        assert "imgw run" in result.stderr
+        assert result.exit_code == 0, (command, result.stderr)
+        assert f"$ {expected}" in result.stdout, (command, result.stdout)
     assert backend.requests == []
 
 
