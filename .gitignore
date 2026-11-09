@@ -218,3 +218,9 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# im-gateway-service local state
+pytest-of-*/
+*.db
+*.db-wal
+*.db-shm

@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "im-gateway-service"
+version = "0.1.0"
+description = "Single-process IM gateway service built on octop-gateway"
+requires-python = ">=3.12"
+license = { text = "AGPL-3.0-or-later" }
+dependencies = [
+    # 通道适配层：pin 到验证过的版本（§8 风险登记：上游高频变更）
+    "octop-gateway==1.0.3",
+    # 控制面
+    "fastapi>=0.115",
+    "uvicorn>=0.30",
+    "pydantic>=2.7",
+    # CLI（不 import core，避免拉起全部平台 SDK）
+    "typer>=0.12",
+    "httpx>=0.27",
+    # 终端二维码
+    "segno>=1.6",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.8",
+    "mypy>=1.9",
+]
+
+[project.scripts]
+imgw = "im_gateway.cli.main:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/im_gateway"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = ["error::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+files = ["src"]
