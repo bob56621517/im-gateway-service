@@ -913,6 +913,14 @@ _ZH_CATALOG: Final[dict[str, str]] = {
     '--bot-key and --bot-token must be provided together': (
         '--bot-key 与 --bot-token 必须同时提供'
     ),
+    (
+        'unknown channel kind {kind!r}; did you mean {suggestion!r}? supported kinds: {kinds}'
+    ): (
+        '未知的通道 kind {kind!r}；是不是想输入 {suggestion!r}？支持的 kind：{kinds}'
+    ),
+    'unknown channel kind {kind!r}; supported kinds: {kinds}': (
+        '未知的通道 kind {kind!r}；支持的 kind：{kinds}'
+    ),
     '--secret-stdin cannot be combined with --bot-token': (
         '--secret-stdin 不能与 --bot-token 同时使用'
     ),

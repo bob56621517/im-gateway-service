@@ -475,6 +475,20 @@ def test_channel_login_secret_stdin_reads_bot_token(
     assert body["config"] == {"bot_id": "wk", "secret": "from-stdin"}
 
 
+def test_channel_login_unknown_kind_suggests_typo(backend: FakeBackend) -> None:
+    result = invoke("channel", "login", "wocom", "--bot-key", "k", "--bot-token", "t")
+    assert result.exit_code == 1
+    assert "unknown channel kind" in result.stderr
+    assert "wecom" in result.stderr  # suggestion for the wocom/wecom typo
+
+
+def test_channel_test_unknown_kind_is_rejected(backend: FakeBackend) -> None:
+    result = invoke("channel", "test", "wocom")
+    assert result.exit_code == 1
+    assert "unknown channel kind" in result.stderr
+    assert all(r.method != "POST" for r in backend.requests)
+
+
 def test_channel_logout_json(backend: FakeBackend) -> None:
     backend.route("PATCH", "/v1/channels/sales", {"channel_id": "feishu:acme:sales"})
     result = invoke("--json", "channel", "logout", "sales")

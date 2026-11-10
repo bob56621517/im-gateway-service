@@ -1320,6 +1320,28 @@ def _get_channel(client: httpx.Client, ref: str) -> dict[str, Any]:
     return cast("dict[str, Any]", payload)
 
 
+def _require_known_kind(kind: str) -> None:
+    """Reject unknown channel kinds early, with a typo suggestion."""
+    from difflib import get_close_matches
+
+    from octop_gateway.channels import SUPPORTED_CHANNEL_KINDS
+
+    supported = sorted(SUPPORTED_CHANNEL_KINDS)
+    if kind in supported:
+        return
+    matches = get_close_matches(kind, supported, n=1, cutoff=0.6)
+    if matches:
+        _fail(
+            t(
+                "unknown channel kind {kind!r}; did you mean {suggestion!r}? supported kinds: {kinds}",
+                kind=kind,
+                suggestion=matches[0],
+                kinds=", ".join(supported),
+            )
+        )
+    _fail(t("unknown channel kind {kind!r}; supported kinds: {kinds}", kind=kind, kinds=", ".join(supported)))
+
+
 def _build_login_config(
     kind: str,
     *,
@@ -1327,6 +1349,7 @@ def _build_login_config(
     bot_token: str,
     config_pairs: list[str] | None,
     secret_stdin: bool,
+    validate_kind: bool = True,
 ) -> dict[str, Any]:
     """Merge neutral credentials + repeated ``--config`` pairs into one config dict.
 
@@ -1336,6 +1359,8 @@ def _build_login_config(
     path by design: an account can only be claimed by scanning its QR/login URL.
     """
     values = _parse_config_pairs(config_pairs)
+    if validate_kind:
+        _require_known_kind(kind)
     if secret_stdin:
         stdin_value = sys.stdin.readline().strip()
         if not stdin_value:
@@ -1827,6 +1852,7 @@ def channel_login(
             bot_token=bot_token,
             config_pairs=config,
             secret_stdin=secret_stdin,
+            validate_kind=existing is None,
         )
         if existing is None:
             if session_id:
@@ -2150,6 +2176,7 @@ def channel_test(
     ] = None,
 ) -> None:
     """Probe credentials without registering a channel."""
+    _require_known_kind(kind)
     entry = ChannelConfigEntry(
         channel_id=f"{kind}:probe",
         kind=kind,
