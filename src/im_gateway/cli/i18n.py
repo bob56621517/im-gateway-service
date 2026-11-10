@@ -891,28 +891,40 @@ _ZH_CATALOG: Final[dict[str, str]] = {
     ): (
         '额外的通道配置 KEY=VALUE；可重复（值会按 bool/int/string 自动推断）。'
     ),
-    # main.py:1662
-    'feishu/qq: app_id.': 'feishu/qq 的 app_id。',
-    # main.py:1665
+    # main.py: bot-key / bot-token neutral credential pair
     (
-        'feishu/qq/dingtalk: app_secret (QQ stores it as `secret`).'
+        'Silent-login credential key: Feishu app_id, WeCom bot_id, DingTalk app_key, '
+        'QQ app_id. Pair it with --bot-token.'
     ): (
-        'feishu/qq/dingtalk：app_secret（QQ 会把 secret 存为 `secret`）。'
+        '静默登录的凭据 key：飞书 app_id、企微 bot_id、钉钉 app_key、QQ app_id；'
+        '需与 --bot-token 成对使用。'
     ),
-    # main.py:1667
-    'wecom: bot_id.': 'wecom 的 bot_id。',
-    # main.py:1668
-    'wecom/qq: bot or application secret.': 'wecom/qq：机器人或应用 secret。',
-    # main.py:1669
-    'dingtalk: app_key (client_id).': 'dingtalk 的 app_key（client_id）。',
-    # main.py:1672
-    'qq: bot token, or weixin: account bot token.': 'qq：机器人 token；或 weixin：账号 bot token。',
-    # main.py:1676
-    'weixin: account id (also fills the `accounts` entry).': 'weixin：账号 id（同时填充 `accounts` 条目）。',
-    # main.py:1678
-    'weixin: API base URL.': 'weixin 的 API base URL。',
-    # main.py:1681
-    'Read the secret from stdin instead of argv.': '从 stdin 读取 secret，而不是放进 argv。',
+    (
+        'Silent-login secret paired with --bot-key (Feishu app_secret, WeCom secret, '
+        'DingTalk app_secret, QQ secret). Prefer --secret-stdin.'
+    ): (
+        '与 --bot-key 配对的静默登录密钥（飞书 app_secret、企微 secret、'
+        '钉钉 app_secret、QQ secret）；建议改用 --secret-stdin。'
+    ),
+    'Read --bot-token from stdin instead of argv (keeps it out of shell history).': (
+        '从 stdin 读取 --bot-token，而不是放进 argv（避免进入 shell 历史）。'
+    ),
+    # main.py: silent-credential validation
+    '--bot-key and --bot-token must be provided together': (
+        '--bot-key 与 --bot-token 必须同时提供'
+    ),
+    '--secret-stdin cannot be combined with --bot-token': (
+        '--secret-stdin 不能与 --bot-token 同时使用'
+    ),
+    '{kind} does not support silent credential login': (
+        '{kind} 不支持静默凭据登录'
+    ),
+    (
+        'weixin does not support silent registration: a WeChat account is bound '
+        'one-to-one by the platform, so use QR login instead'
+    ): (
+        '微信不支持静默注册：微信账号由平台一对一绑定，请改用扫码登录'
+    ),
     # main.py:1685
     'Force a fresh QR scan even when credentials exist.': '即使已有凭据也强制重新扫码。',
     # main.py:1689
@@ -981,122 +993,135 @@ _ZH_CATALOG: Final[dict[str, str]] = {
     # main.py:1833
     (
         'channel {ref!r} ({kind}) does not support QR login; pass credentials instead '
-        '(--app-id/--app-secret, ...)'
+        '(--bot-key/--bot-token, or --config)'
     ): (
-        '通道 {ref!r}（{kind}）不支持扫码登录；请改用凭据参数（--app-id/--app-secret 等）直接登录'
+        '通道 {ref!r}（{kind}）不支持扫码登录；请改用凭据参数'
+        '（--bot-key/--bot-token，或 --config）直接登录'
     ),
-    # main.py:1563
+    # main.py:help
     (
-        'Bind or re-bind a channel instance: scan a QR code, pass credentials silently, or '
-        'reconnect an already-bound channel.\n'
+        'Bind or re-bind a channel instance: scan a QR code, pass credentials'
+        ' silently, or reconnect an already-bound channel.\n'
         '\n'
-        'TARGET is either an existing channel_id/alias to re-bind, or a channel kind '
-        '(feishu/wecom/dingtalk/qq/weixin) to create a new instance.\n'
+        'TARGET is either an existing channel_id/alias to re-bind, or a channel'
+        ' kind (feishu/wecom/dingtalk/qq/weixin) to create a new instance.\n'
         '\n'
         'Behavior matrix:\n'
         '\n'
-        '\b\n'
-        'new target, no credentials         QR login (auto-enabled on confirmation)\n'
-        'new target, credential flags       silent registration (no QR, enabled immediately)\n'
-        'existing target, credentials ok    reconnect / re-enable without scanning\n'
+        '\x08\n'
+        'new target, no credentials         QR login (auto-enabled on'
+        ' confirmation)\n'
+        'new target, --bot-key/--bot-token silent registration (no QR, enabled'
+        ' immediately)\n'
+        'existing target, credentials ok    reconnect / re-enable without'
+        ' scanning\n'
         'existing target, credentials lost  QR login\n'
-        'existing target, credential flags  overwrite credentials, then reconnect\n'
-        'existing target + --rescan         force a fresh QR scan (expired token, new account)\n'
+        'existing target, --bot-key/--bot-token  overwrite credentials, then'
+        ' reconnect\n'
+        'existing target + --rescan         force a fresh QR scan (expired'
+        ' token, new account)\n'
         '\n'
-        'Per-platform credential flags:\n'
+        'Per-platform credentials use ONE neutral pair:\n'
         '\n'
-        '\b\n'
-        'feishu    --app-id / --app-secret\n'
-        'wecom     --bot-id / --secret\n'
-        'dingtalk  --app-key / --app-secret\n'
-        'qq        --app-id / --secret        (QQ stores the secret as `secret`)\n'
-        'weixin    --token / --account-id / --base-url   (also builds an `accounts` entry)\n'
+        '\x08\n'
+        '--bot-key     Feishu app_id | WeCom bot_id | DingTalk app_key | QQ'
+        ' app_id\n'
+        '--bot-token   Feishu app_secret | WeCom secret | DingTalk app_secret |'
+        ' QQ secret\n'
         '\n'
-        'Use --secret-stdin to read the secret from stdin instead of argv (keeps it out of the '
-        'process list), --check to probe new credentials before registering, and --no-wait to '
-        'print the QR challenge immediately and resume later with --session-id.'
+        'WeChat is QR-only: a WeChat account is bound one-to-one by the'
+        ' platform, so\n'
+        '--bot-key/--bot-token are rejected for weixin; scan its QR (or open the'
+        ' login\n'
+        'URL) instead.\n'
+        '\n'
+        'Use --secret-stdin to read --bot-token from stdin instead of argv'
+        ' (keeps it out of the process list), --config KEY=VALUE for advanced'
+        ' fields, --check to probe new credentials before registering, and'
+        ' --no-wait to print the QR challenge immediately and resume later with'
+        ' --session-id.'
     ): (
         '绑定或重新绑定一个通道实例：扫码登录、静默传入凭据，或重连已绑定的通道。\n'
         '\n'
-        'TARGET 可以是已存在的 channel_id/alias（重新绑定），也可以是通道 '
-        'kind（feishu/wecom/dingtalk/qq/weixin，用于新建实例）。\n'
+        'TARGET 可以是已存在的 channel_id/alias（重新绑定），也可以是通道'
+        ' kind（feishu/wecom/dingtalk/qq/weixin，用于新建实例）。\n'
         '\n'
         '行为矩阵：\n'
         '\n'
-        '\b\n'
-        '新目标，无凭据        扫码登录（确认后自动启用）\n'
-        '新目标，带凭据参数    静默注册（不扫码，立即启用）\n'
-        '已有目标，凭据齐全    直接重连 / 重新启用，不扫码\n'
-        '已有目标，凭据缺失    扫码登录\n'
-        '已有目标，带凭据参数  覆盖凭据后重连\n'
-        '已有目标 + --rescan   强制重新扫码（token 过期、换账号）\n'
+        '\x08\n'
+        '新目标，无凭据              扫码登录（确认后自动启用）\n'
+        '新目标，--bot-key/--bot-token  静默注册（不扫码，立即启用）\n'
+        '已有目标，凭据齐全          直接重连 / 重新启用，不扫码\n'
+        '已有目标，凭据缺失          扫码登录\n'
+        '已有目标，--bot-key/--bot-token  覆盖凭据后重连\n'
+        '已有目标 + --rescan         强制重新扫码（token 过期、换账号）\n'
         '\n'
-        '各平台凭据参数：\n'
+        '各平台凭据统一为一对中性参数：\n'
         '\n'
-        '\b\n'
-        'feishu    --app-id / --app-secret\n'
-        'wecom     --bot-id / --secret\n'
-        'dingtalk  --app-key / --app-secret\n'
-        'qq        --app-id / --secret        （QQ 把 secret 存为 `secret`）\n'
-        'weixin    --token / --account-id / --base-url   （同时生成 `accounts` 条目）\n'
+        '\x08\n'
+        '--bot-key     飞书 app_id | 企微 bot_id | 钉钉 app_key | QQ app_id\n'
+        '--bot-token   飞书 app_secret | 企微 secret | 钉钉 app_secret | QQ secret\n'
         '\n'
-        '用 --secret-stdin 从 stdin 读取 secret 而不是放在 argv 里（避免出现在进程列表），用 '
-        '--check 在注册前先探测新凭据，用 --no-wait 立即打印二维码 challenge 并稍后用 '
-        '--session-id 继续。'
+        '微信只能扫码：微信账号由平台一对一绑定，因此 weixin 不接受'
+        ' --bot-key/--bot-token；请扫描其二维码（或打开登录链接）完成绑定。\n'
+        '\n'
+        '用 --secret-stdin 从 stdin 读取 --bot-token（避免出现在进程列表），用 --config KEY=VALUE'
+        ' 传高级字段，用 --check 在注册前先探测新凭据，用 --no-wait 立即打印二维码 challenge 并稍后用'
+        ' --session-id 继续。'
     ),
-    # main.py:1594
+    # main.py:examples
     (
         'Examples:\n'
         '\n'
-        '\b\n'
-        '# 1. create a channel by QR scan (prints URL + terminal QR; also writes a PNG)\n'
+        '\x08\n'
+        '# 1. create a channel by QR scan (prints URL + terminal QR; also writes'
+        ' a PNG)\n'
         '$ imgw channel login weixin:wx --qr-png ./weixin-qr.png\n'
         '\n'
-        '\b\n'
+        '\x08\n'
         '# 2. create a channel silently from credentials (no scan)\n'
         '$ imgw channel login feishu --id feishu:acme:sales --name sales \\\n'
-        '    --app-id cli_xxx --app-secret "$FEISHU_APP_SECRET"\n'
+        '    --bot-key cli_xxx --bot-token "$FEISHU_APP_SECRET"\n'
         '\n'
-        '\b\n'
-        '# 3. overwrite the credentials of an existing channel and reconnect\n'
-        '$ imgw channel login feishu:acme:sales --app-id cli_yyy \\\n'
-        '    --app-secret "$FEISHU_APP_SECRET"\n'
+        '\x08\n'
+        '# 3. read the credential secret from stdin (recommended for scripts)\n'
+        '$ printf \'%s\' "$FEISHU_APP_SECRET" | imgw channel login feishu \\\n'
+        '    --bot-key cli_xxx --secret-stdin\n'
         '\n'
-        '\b\n'
+        '\x08\n'
         '# 4. force a fresh scan (e.g. an expired WeChat session)\n'
         '$ imgw channel login weixin:wx --rescan\n'
         '\n'
-        '\b\n'
-        '# 5. scripted flow: print the URL and exit, then resume with --session-id\n'
+        '\x08\n'
+        '# 5. scripted flow: print the URL and exit, then resume with'
+        ' --session-id\n'
         '$ imgw channel login weixin:wx --format url --no-wait\n'
         '$ imgw channel login weixin:wx --session-id abc123 --format json\n'
-        ''
     ): (
         '示例：\n'
         '\n'
-        '\b\n'
+        '\x08\n'
         '# 1. 扫码创建通道（打印 URL + 终端二维码，同时写出 PNG）\n'
         '$ imgw channel login weixin:wx --qr-png ./weixin-qr.png\n'
         '\n'
-        '\b\n'
+        '\x08\n'
         '# 2. 用凭据静默创建通道（不扫码）\n'
         '$ imgw channel login feishu --id feishu:acme:sales --name sales \\\n'
-        '    --app-id cli_xxx --app-secret "$FEISHU_APP_SECRET"\n'
+        '    --bot-key cli_xxx --bot-token "$FEISHU_APP_SECRET"\n'
         '\n'
-        '\b\n'
-        '# 3. 覆盖已有通道的凭据并重连\n'
-        '$ imgw channel login feishu:acme:sales --app-id cli_yyy \\\n'
-        '    --app-secret "$FEISHU_APP_SECRET"\n'
+        '\x08\n'
+        '# 3. 从 stdin 读取凭据密钥（脚本推荐）\n'
+        '$ printf \'%s\' "$FEISHU_APP_SECRET" | imgw channel login feishu \\\n'
+        '    --bot-key cli_xxx --secret-stdin\n'
         '\n'
-        '\b\n'
+        '\x08\n'
         '# 4. 强制重新扫码（例如微信会话过期）\n'
         '$ imgw channel login weixin:wx --rescan\n'
         '\n'
-        '\b\n'
+        '\x08\n'
         '# 5. 脚本流程：只打印 URL 后退出，之后用 --session-id 继续\n'
         '$ imgw channel login weixin:wx --format url --no-wait\n'
         '$ imgw channel login weixin:wx --session-id abc123 --format json\n'
-        ''
     ),
     # main.py:1620
     'Bind or re-bind a channel (QR, credentials, reconnect).': '绑定或重新绑定通道（扫码/凭据/重连）。',

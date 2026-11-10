@@ -332,12 +332,10 @@ def test_english_channel_login_help_covers_every_mode_and_platform() -> None:
         "--rescan",
         "--no-wait",
         "--session-id",
-        "--app-id",
-        "--app-secret",
-        "--bot-id",
-        "--app-key",
-        "--account-id",
-        "--base-url",
+        "--bot-key",
+        "--bot-token",
+        "--secret-stdin",
+        "--config",
         "feishu",
         "wecom",
         "dingtalk",
@@ -346,6 +344,7 @@ def test_english_channel_login_help_covers_every_mode_and_platform() -> None:
         "QR login",
         "silent registration",
         "reconnect",
+        "QR-only",
     ):
         assert token in text, token
 

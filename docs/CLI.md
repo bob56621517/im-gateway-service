@@ -50,7 +50,7 @@ IMGW_LANG=zh_CN.UTF-8 uv run imgw channel login --help
 
 | 旧命令 | 新命令 | 说明 |
 |---|---|---|
-| `channel add <kind> --id --config` | `channel login <kind> --id --app-id …` | 静默注册统一走 login；`--config` 仍可用 |
+| `channel add <kind> --id --config` | `channel login <kind> --id --bot-key … --bot-token …` | 静默注册统一走 login；`--config` 仍可用 |
 | `channel ls` | `channel list` | 默认带表头；默认包含 disabled |
 | `channel show <ref>` | `channel list <ref>` | 详情合并进 list（脱敏 config） |
 | `channel rm <ref>` | `channel delete <ref>` | **必须先 logout** |
@@ -88,14 +88,34 @@ IMGW_LANG=zh_CN.UTF-8 uv run imgw channel login --help
 
 `TurnFrame` 线上契约不变；`start.channel.tenant_id` 作为冻结字段保留，恒为 `""`。
 
-### 3.5 迁移示例
+### 3.5 静默凭据参数归一化（2026-11-10）
+
+所有平台的静默凭据收敛为一对中性参数，旧的六组平台专属参数**已删除、不留别名**：
+
+| 变更 | 说明 |
+|---|---|
+| 新增 `--bot-key` / `--bot-token` | 内部按 kind 映射到上游字段：飞书 `app_id/app_secret`、企微 `bot_id/secret`、钉钉 `app_key/app_secret`、QQ `app_id/secret` |
+| 删除 `--app-id` / `--app-secret` / `--bot-id` / `--secret` / `--app-key` / `--token` | 用 `--bot-key/--bot-token` 或 `--config KEY=VALUE` 代替 |
+| 微信仅扫码 | 微信账号由平台一对一绑定，`weixin` 传 `--bot-key/--bot-token` 会报错；只能扫码/打开登录 URL |
+| `--secret-stdin` | 改为读取 `--bot-token`，避免密钥进入 argv/进程列表 |
+
+```bash
+# 旧
+imgw channel login wecom --bot-id BOT --secret S
+imgw channel login dingtalk --app-key AK --app-secret SK
+# 新
+imgw channel login wecom --bot-key BOT --bot-token S
+printf '%s' "$SK" | imgw channel login dingtalk --bot-key AK --secret-stdin
+```
+
+### 3.6 迁移示例
 
 ```bash
 # 旧：手工建通道并禁用
 imgw channel add feishu --id feishu:acme:sales --config app_id=cli_x --config app_secret=... --disabled
 
 # 新：静默登录（自动启用）
-imgw channel login feishu --id feishu:acme:sales --app-id cli_x --app-secret ...
+imgw channel login feishu --id feishu:acme:sales --bot-key cli_x --bot-token ...
 
 # 旧：列表 + 详情
 imgw channel ls

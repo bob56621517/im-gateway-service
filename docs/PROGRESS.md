@@ -41,6 +41,22 @@
 | 提示 | 无 | 输出二维码后打印**一行**：`用{App}扫描二维码(，二维码有效期 {ttl})，或者在{App}中点击链接：{url}`；TTL 未知不显示有效期；中英双语 |
 | 企微/QQ | — | 平台无 TTL 参数：跟随平台，不编造有效期 |
 
+## 0.3 静默凭据参数归一化（2026-11-10）
+
+所有平台收敛为一对中性参数 `--bot-key` / `--bot-token`，按 kind 映射到上游字段：
+
+| kind | bot-key → | bot-token → |
+|---|---|---|
+| feishu | `app_id` | `app_secret` |
+| wecom | `bot_id` | `secret` |
+| dingtalk | `app_key` | `app_secret` |
+| qq | `app_id` | `secret` |
+| weixin | **不支持静默**（平台一对一绑定，只能扫码/打开登录 URL） | — |
+
+- 旧参数（`--app-id/--app-secret/--bot-id/--secret/--app-key/--token/--account-id/--base-url`）**直接删除、不留别名**；
+- `--bot-key`/`--bot-token` 必须成对出现；`--secret-stdin` 读取 `--bot-token`；`--config KEY=VALUE` 仍是高级兜底；
+- 微信传静默参数会明确报错并提示扫码。
+
 ## 1. 已完成
 
 ### 1.1 CLI 重构（破坏性，无别名）
@@ -89,7 +105,7 @@
 | 4 | backend token 为空时发送 `Authorization: Bearer `（非法头） | 空 token 不发送该头 |
 | 5 | 登录成功但启用失败时凭据被回滚丢失 | 先落库（`enabled=false`）再启用，失败保留并告警 |
 | 6 | 微信私聊 `chat_type` 为空 | 仅对 `weixin` 在 `start` 帧补 `direct` |
-| 7 | QQ 扫码凭据键名写错：落库 `app_secret`，上游 `QQConfig` 要求 `secret` | adapter 与 CLI `--app-secret` 对 qq 统一映射为 `secret` |
+| 7 | QQ 扫码凭据键名写错：落库 `app_secret`，上游 `QQConfig` 要求 `secret` | adapter 落库 `secret`；CLI 统一用 `--bot-key/--bot-token` 映射（§0.3） |
 | 8 | Windows GBK 控制台执行 `imgw history` 遇 emoji（回显里的 ✅）直接 `UnicodeEncodeError` | CLI 启动时 stdout/stderr `errors="replace"` 降级 |
 | 9 | `GET /v1/channels/{ref}/subjects` 500/400：企微 subject metadata 带活 `WSClient`，FastAPI 无法序列化 | `runtime._json_safe()` 统一降级为 JSON 原生类型（DB 侧原本就有 `_durable_subject_metadata` 过滤） |
 | 10 | 钉钉扫码后 CLI 立刻报「二维码已过期」：`/app/registration/poll` 在扫码后返回 `SCANNED`，我们只认 WAITING/SUCCESS/FAIL | 扫描后的 `SCANNED / CREATING / PUBLISHING / APPROVING` 及未知状态一律继续轮询；`APPROVING` 若已带回凭据则保存并告警「待管理员审批」 |
@@ -123,8 +139,8 @@ uv run mypy src              Success: no issues found (29 source files)
 
 ## 4. 未完成 / 下一步
 
-1. **静默注册真机验证**：企微 `--bot-id/--secret`、钉钉 `--app-key/--app-secret`、QQ `--app-id/--app-secret`（扫码已产出凭据，可 logout 后用同一凭据重新登录验证）；
-2. **飞书** → 换企业账号/已发布的「企业自建应用」凭据（或解除租户数据安全策略）后 `channel login feishu:smoke --app-id … --app-secret …`；
+1. **静默注册真机验证**：`--bot-key/--bot-token` 分别对企微 / 钉钉 / QQ / 飞书（微信仅扫码）；扫码已产出凭据，可 logout 后用同一凭据重新登录验证；
+2. **飞书** → 换企业账号/已发布的「企业自建应用」凭据（或解除租户数据安全策略）后 `channel login feishu:smoke --bot-key … --bot-token …`；
 3. **capability 真机校准**（`core/capabilities.py` 当前为初值）；
 4. **冒烟流程固化**：`scripts/smoke/` + `pytest -m live` + `docs/SMOKE.md`；
 5. **开机自启**：`imgw install-service`（NSSM/systemd）。

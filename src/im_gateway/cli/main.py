@@ -48,6 +48,7 @@ from im_gateway.cli.service import (
     service_file_path,
 )
 from im_gateway.core.config import ChannelConfigEntry, ConfigDocument
+from im_gateway.core.credentials import SILENT_LOGIN_KINDS, silent_login_config
 
 __all__ = ["app", "main"]
 
@@ -1322,62 +1323,39 @@ def _get_channel(client: httpx.Client, ref: str) -> dict[str, Any]:
 def _build_login_config(
     kind: str,
     *,
-    app_id: str,
-    app_secret: str,
-    bot_id: str,
-    secret: str,
-    app_key: str,
-    token: str,
-    account_id: str,
-    base_url: str,
+    bot_key: str,
+    bot_token: str,
     config_pairs: list[str] | None,
     secret_stdin: bool,
 ) -> dict[str, Any]:
-    """Merge credential flags + repeated ``--config`` pairs into one config dict."""
+    """Merge neutral credentials + repeated ``--config`` pairs into one config dict.
+
+    ``--bot-key`` / ``--bot-token`` are the single, platform-neutral way to pass
+    silent credentials; they are mapped onto the upstream field names per kind
+    (see ``core.credentials.SILENT_CREDENTIAL_FIELDS``).  WeChat has no silent
+    path by design: an account can only be claimed by scanning its QR/login URL.
+    """
     values = _parse_config_pairs(config_pairs)
-    stdin_secret = ""
     if secret_stdin:
-        stdin_secret = sys.stdin.readline().strip()
-        if not stdin_secret:
+        stdin_value = sys.stdin.readline().strip()
+        if not stdin_value:
             _fail(t("--secret-stdin: no secret found on stdin"))
-    if app_id:
-        values["app_id"] = app_id
-    if app_secret:
-        # QQ's channel config names the app secret ``secret``; other kinds use
-        # ``app_secret`` (upstream ``QQConfig.required_credentials``).
-        values["secret" if kind == "qq" else "app_secret"] = app_secret
-    if bot_id:
-        values["bot_id"] = bot_id
-    if secret:
-        values["secret"] = secret
-    if app_key:
-        values["app_key"] = app_key
-    if token:
-        values["token"] = token
-    if base_url:
-        values["base_url"] = base_url
-    if account_id:
-        account: dict[str, Any] = {"account_id": account_id}
-        if token:
-            account["token"] = token
-        if base_url:
-            account["base_url"] = base_url
-        values["accounts"] = [account]
-    if stdin_secret:
-        if kind in {"wecom", "qq"}:
-            values["secret"] = stdin_secret
-        elif kind in {"feishu", "dingtalk"}:
-            values["app_secret"] = stdin_secret
-        elif kind == "weixin":
-            accounts = values.get("accounts")
-            if isinstance(accounts, list):
-                for account in accounts:
-                    if isinstance(account, dict):
-                        account.setdefault("token", stdin_secret)
-            else:
-                values["token"] = stdin_secret
-        else:
-            values["secret"] = stdin_secret
+        if bot_token:
+            _fail(t("--secret-stdin cannot be combined with --bot-token"))
+        bot_token = stdin_value
+    if bool(bot_key) != bool(bot_token):
+        _fail(t("--bot-key and --bot-token must be provided together"))
+    if bot_key and bot_token:
+        if kind == "weixin":
+            _fail(
+                t(
+                    "weixin does not support silent registration: a WeChat account is "
+                    "bound one-to-one by the platform, so use QR login instead"
+                )
+            )
+        if kind not in SILENT_LOGIN_KINDS:
+            _fail(t("{kind} does not support silent credential login", kind=kind))
+        values.update(silent_login_config(kind, bot_key, bot_token))
     return values
 
 
@@ -1650,25 +1628,26 @@ def _channel_tsv_row(channel: dict[str, Any]) -> list[str]:
         "\n"
         "\b\n"
         "new target, no credentials         QR login (auto-enabled on confirmation)\n"
-        "new target, credential flags       silent registration (no QR, enabled immediately)\n"
+        "new target, --bot-key/--bot-token silent registration (no QR, enabled immediately)\n"
         "existing target, credentials ok    reconnect / re-enable without scanning\n"
         "existing target, credentials lost  QR login\n"
-        "existing target, credential flags  overwrite credentials, then reconnect\n"
+        "existing target, --bot-key/--bot-token  overwrite credentials, then reconnect\n"
         "existing target + --rescan         force a fresh QR scan (expired token, new account)\n"
         "\n"
-        "Per-platform credential flags:\n"
+        "Per-platform credentials use ONE neutral pair:\n"
         "\n"
         "\b\n"
-        "feishu    --app-id / --app-secret\n"
-        "wecom     --bot-id / --secret\n"
-        "dingtalk  --app-key / --app-secret\n"
-        "qq        --app-id / --secret        (QQ stores the secret as `secret`)\n"
-        "weixin    --token / --account-id / --base-url   (also builds an `accounts` entry)\n"
+        "--bot-key     Feishu app_id | WeCom bot_id | DingTalk app_key | QQ app_id\n"
+        "--bot-token   Feishu app_secret | WeCom secret | DingTalk app_secret | QQ secret\n"
         "\n"
-        "Use --secret-stdin to read the secret from stdin instead of argv (keeps it "
-        "out of the process list), --check to probe new credentials before "
-        "registering, and --no-wait to print the QR challenge immediately and "
-        "resume later with --session-id."
+        "WeChat is QR-only: a WeChat account is bound one-to-one by the platform, so\n"
+        "--bot-key/--bot-token are rejected for weixin; scan its QR (or open the login\n"
+        "URL) instead.\n"
+        "\n"
+        "Use --secret-stdin to read --bot-token from stdin instead of argv (keeps it "
+        "out of the process list), --config KEY=VALUE for advanced fields, --check to "
+        "probe new credentials before registering, and --no-wait to print the QR "
+        "challenge immediately and resume later with --session-id."
     ),
     epilog=t(
         "Examples:\n"
@@ -1680,12 +1659,12 @@ def _channel_tsv_row(channel: dict[str, Any]) -> list[str]:
         "\b\n"
         "# 2. create a channel silently from credentials (no scan)\n"
         "$ imgw channel login feishu --id feishu:acme:sales --name sales \\\n"
-        "    --app-id cli_xxx --app-secret \"$FEISHU_APP_SECRET\"\n"
+        "    --bot-key cli_xxx --bot-token \"$FEISHU_APP_SECRET\"\n"
         "\n"
         "\b\n"
-        "# 3. overwrite the credentials of an existing channel and reconnect\n"
-        "$ imgw channel login feishu:acme:sales --app-id cli_yyy \\\n"
-        "    --app-secret \"$FEISHU_APP_SECRET\"\n"
+        "# 3. read the credential secret from stdin (recommended for scripts)\n"
+        "$ printf '%s' \"$FEISHU_APP_SECRET\" | imgw channel login feishu \\\n"
+        "    --bot-key cli_xxx --secret-stdin\n"
         "\n"
         "\b\n"
         "# 4. force a fresh scan (e.g. an expired WeChat session)\n"
@@ -1734,26 +1713,32 @@ def channel_login(
             ),
         ),
     ] = None,
-    app_id: Annotated[str, typer.Option("--app-id", help=t("feishu/qq: app_id."))] = "",
-    app_secret: Annotated[
+    bot_key: Annotated[
         str,
-        typer.Option("--app-secret", help=t("feishu/qq/dingtalk: app_secret (QQ stores it as `secret`).")),
+        typer.Option(
+            "--bot-key",
+            help=t(
+                "Silent-login credential key: Feishu app_id, WeCom bot_id, DingTalk "
+                "app_key, QQ app_id. Pair it with --bot-token."
+            ),
+        ),
     ] = "",
-    bot_id: Annotated[str, typer.Option("--bot-id", help=t("wecom: bot_id."))] = "",
-    secret: Annotated[str, typer.Option("--secret", help=t("wecom/qq: bot or application secret."))] = "",
-    app_key: Annotated[str, typer.Option("--app-key", help=t("dingtalk: app_key (client_id)."))] = "",
-    token: Annotated[
+    bot_token: Annotated[
         str,
-        typer.Option("--token", help=t("qq: bot token, or weixin: account bot token.")),
+        typer.Option(
+            "--bot-token",
+            help=t(
+                "Silent-login secret paired with --bot-key (Feishu app_secret, WeCom "
+                "secret, DingTalk app_secret, QQ secret). Prefer --secret-stdin."
+            ),
+        ),
     ] = "",
-    account_id: Annotated[
-        str,
-        typer.Option("--account-id", help=t("weixin: account id (also fills the `accounts` entry).")),
-    ] = "",
-    base_url: Annotated[str, typer.Option("--base-url", help=t("weixin: API base URL."))] = "",
     secret_stdin: Annotated[
         bool,
-        typer.Option("--secret-stdin", help=t("Read the secret from stdin instead of argv.")),
+        typer.Option(
+            "--secret-stdin",
+            help=t("Read --bot-token from stdin instead of argv (keeps it out of shell history)."),
+        ),
     ] = False,
     rescan: Annotated[
         bool,
@@ -1831,21 +1816,18 @@ def channel_login(
         )
     if timeout <= 0:
         _fail(t("--timeout must be a positive number"))
-    values = _build_login_config(
-        target,
-        app_id=app_id,
-        app_secret=app_secret,
-        bot_id=bot_id,
-        secret=secret,
-        app_key=app_key,
-        token=token,
-        account_id=account_id,
-        base_url=base_url,
-        config_pairs=config,
-        secret_stdin=secret_stdin,
-    )
     with get_client(options.url, options.token) as client:
         existing = _channel_or_none(client, target)
+        # Neutral credentials map onto per-kind config fields, so resolve the
+        # kind first: for an existing channel the positional arg is a ref.
+        kind = str(existing.get("kind") or target) if existing is not None else target
+        values = _build_login_config(
+            kind,
+            bot_key=bot_key,
+            bot_token=bot_token,
+            config_pairs=config,
+            secret_stdin=secret_stdin,
+        )
         if existing is None:
             if session_id:
                 _fail(t("--session-id can only be used with an existing channel"))
@@ -1913,7 +1895,7 @@ def channel_login(
                 _fail(
                     t(
                         "channel {ref!r} ({kind}) does not support QR login; pass "
-                        "credentials instead (--app-id/--app-secret, ...)",
+                        "credentials instead (--bot-key/--bot-token, or --config)",
                         ref=ref,
                         kind=existing.get("kind"),
                     )

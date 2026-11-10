@@ -396,9 +396,9 @@ def test_channel_login_silent_registers_new_channel(backend: FakeBackend) -> Non
             "feishu:acme:sales",
             "--name",
             "sales",
-            "--app-id",
+            "--bot-key",
             "cli_x",
-            "--app-secret",
+            "--bot-token",
             "sekret",
         ],
     )
@@ -424,9 +424,9 @@ def test_channel_login_check_probes_before_create(backend: FakeBackend) -> None:
             "feishu",
             "--id",
             "feishu:acme:sales",
-            "--app-id",
+            "--bot-key",
             "cli_x",
-            "--app-secret",
+            "--bot-token",
             "s",
             "--check",
         ],
@@ -508,7 +508,7 @@ def test_channel_login_existing_overwrites_credentials(backend: FakeBackend) -> 
     backend.route("PATCH", "/v1/channels/feishu:acme:sales", channel_view())
     result = runner.invoke(
         cli.app,
-        ["channel", "login", "feishu:acme:sales", "--app-secret", "new-secret"],
+        ["channel", "login", "feishu:acme:sales", "--config", "app_secret=new-secret"],
     )
     assert result.exit_code == 0, result.stderr
     assert json.loads(backend.recorded("PATCH", "/v1/channels/feishu:acme:sales").content) == {

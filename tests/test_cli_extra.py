@@ -8,6 +8,7 @@ never read, and system commands go through injected fake runners.
 
 from __future__ import annotations
 
+import io
 import json
 import subprocess
 from pathlib import Path
@@ -413,9 +414,9 @@ def test_channel_login_silent_json(backend: FakeBackend) -> None:
         "feishu",
         "--id",
         "cli:added",
-        "--config",
-        "app_id=cli",
-        "--app-secret",
+        "--bot-key",
+        "cli",
+        "--bot-token",
         "s",
     )
     assert result.exit_code == 0, result.stderr
@@ -426,23 +427,52 @@ def test_channel_login_silent_json(backend: FakeBackend) -> None:
     assert body["config"] == {"app_id": "cli", "app_secret": "s"}
 
 
-def test_channel_login_silent_qq_maps_secret(backend: FakeBackend) -> None:
-    backend.route("POST", "/v1/channels", {"channel_id": "qq:bot", "state": "disabled"})
+def test_channel_login_silent_maps_neutral_pair_per_kind(backend: FakeBackend) -> None:
+    cases = {
+        "feishu": {"app_id": "k", "app_secret": "t"},
+        "wecom": {"bot_id": "k", "secret": "t"},
+        "dingtalk": {"app_key": "k", "app_secret": "t"},
+        "qq": {"app_id": "k", "secret": "t"},
+    }
+    for kind, expected in cases.items():
+        backend.route("POST", "/v1/channels", {"channel_id": f"{kind}:bot"})
+        result = invoke(
+            "channel", "login", kind, "--id", f"{kind}:bot",
+            "--bot-key", "k", "--bot-token", "t",
+        )
+        assert result.exit_code == 0, (kind, result.stderr)
+        body = json.loads(backend.recorded("POST", "/v1/channels").content)
+        assert body["config"] == expected, kind
+
+
+def test_channel_login_silent_rejects_weixin(backend: FakeBackend) -> None:
     result = invoke(
-        "--json",
-        "channel",
-        "login",
-        "qq",
-        "--id",
-        "qq:bot",
-        "--app-id",
-        "1024",
-        "--app-secret",
-        "s3cr3t",
+        "channel", "login", "weixin", "--bot-key", "k", "--bot-token", "t"
+    )
+    assert result.exit_code == 1
+    assert "QR login" in result.stderr
+    assert all(r.method != "POST" for r in backend.requests)
+
+
+def test_channel_login_requires_both_neutral_credentials(backend: FakeBackend) -> None:
+    result = invoke("channel", "login", "feishu", "--bot-key", "k")
+    assert result.exit_code == 1
+    assert "must be provided together" in result.stderr
+    assert all(r.method != "POST" for r in backend.requests)
+
+
+def test_channel_login_secret_stdin_reads_bot_token(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    backend.route("POST", "/v1/channels", {"channel_id": "wecom:bot"})
+    monkeypatch.setattr(cli, "sys", SimpleNamespace(stdin=io.StringIO("from-stdin\n")))
+    result = invoke(
+        "channel", "login", "wecom", "--id", "wecom:bot",
+        "--bot-key", "wk", "--secret-stdin",
     )
     assert result.exit_code == 0, result.stderr
     body = json.loads(backend.recorded("POST", "/v1/channels").content)
-    assert body["config"] == {"app_id": "1024", "secret": "s3cr3t"}
+    assert body["config"] == {"bot_id": "wk", "secret": "from-stdin"}
 
 
 def test_channel_logout_json(backend: FakeBackend) -> None:
