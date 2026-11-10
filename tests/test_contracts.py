@@ -201,6 +201,41 @@ def test_start_from_inbound_maps_fields() -> None:
     assert frame.capabilities is not None
 
 
+@pytest.mark.parametrize(
+    ("channel_type", "upstream_chat_type", "expected"),
+    [
+        ("weixin", "", "direct"),  # WeChat iLink bot leaves chat_type empty
+        ("weixin", "group", "group"),  # explicit value always wins
+        ("feishu", "", ""),  # other kinds stay empty: no guessing
+    ],
+)
+def test_start_from_inbound_chat_type_defaults(
+    channel_type: str, upstream_chat_type: str, expected: str
+) -> None:
+    from octop_gateway.models import ChannelSubject, InboundMessage
+    from octop_gateway.models import TextContent as UpstreamText
+
+    message = InboundMessage(
+        channel_id=f"{channel_type}:acme:test",
+        channel_type=channel_type,
+        tenant_id=None,
+        channel_subject=ChannelSubject(subject_id="u_1", chat_type=upstream_chat_type),
+        content=[UpstreamText(text="hi")],
+        metadata={},
+    )
+    frame = start_from_inbound(
+        message,
+        session_key="u_1",
+        idempotency_key="k_1",
+        deadline_ms=1_000,
+        capabilities=capabilities_for(channel_type),
+        turn_id="01TEST",
+    )
+
+    assert frame.subject is not None
+    assert frame.subject.chat_type == expected
+
+
 def test_capabilities_table_covers_all_upstream_kinds() -> None:
     from octop_gateway.channels import SUPPORTED_CHANNEL_KINDS
 

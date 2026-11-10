@@ -281,10 +281,15 @@ def test_channels_crud_and_manager_calls(harness: Harness) -> None:
         "enabled",
         "state",
         "last_error",
+        "login_supported",
+        "credentials",
         "capabilities",
         "created_at",
         "last_started_at",
+        "config",
     }
+    assert created["config"]["app_secret"] == "***"
+    assert created["credentials"]["configured"] is True
     assert created["state"] == "running"
     assert created["last_error"] is None
     assert created["capabilities"]["streaming"] == "buffered"
@@ -362,6 +367,12 @@ def test_channels_crud_and_manager_calls(harness: Harness) -> None:
     # Empty / unknown PATCH payloads are 400s, not silent no-ops.
     assert harness.client.patch("/v1/channels/sales2", json={}, headers=AUTH).status_code == 400
 
+    # Deleting requires the channel to be logged out first (409 guard).
+    blocked = harness.client.delete("/v1/channels/sales2", headers=AUTH)
+    assert blocked.status_code == 409
+    assert "logout" in blocked.json()["detail"]
+    harness.client.patch("/v1/channels/sales2", json={"enabled": False}, headers=AUTH)
+
     # Deleting stops the channel, removes the DB row and honours --purge.
     deleted = harness.client.delete("/v1/channels/sales2", params={"purge": "true"}, headers=AUTH)
     assert deleted.status_code == 200
@@ -369,6 +380,29 @@ def test_channels_crud_and_manager_calls(harness: Harness) -> None:
     assert harness.store.get_channel(CHANNEL_ID) is None
     assert harness.manager.removed[-1] == CHANNEL_ID
     assert harness.client.get("/v1/channels/sales2", headers=AUTH).status_code == 404
+
+
+def test_channel_patch_config_merges_masked_and_partial(harness: Harness) -> None:
+    add_channel(harness)
+    updated = harness.client.patch(
+        "/v1/channels/sales",
+        json={"config": {"app_secret": "***"}},
+        headers=AUTH,
+    )
+    assert updated.status_code == 200
+    stored = harness.store.get_channel(CHANNEL_ID)
+    assert stored is not None
+    # "***" keeps the stored secret; omitted keys are preserved (partial PATCH).
+    assert stored.config["app_secret"] == "literal-secret"
+    assert stored.config["app_id"] == "cli_x"
+
+    # A masked value with no stored fallback is a 400, not a silent literal "***".
+    missing = harness.client.patch(
+        "/v1/channels/sales",
+        json={"config": {"token": "***"}},
+        headers=AUTH,
+    )
+    assert missing.status_code == 400
 
 
 def test_channel_add_failure_returns_400_without_db_row(harness: Harness) -> None:

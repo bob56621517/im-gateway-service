@@ -921,3 +921,16 @@ async def test_non_json_metadata_objects_are_sanitized(store: Store) -> None:
     rows = store.query_history(channel_id="feishu:acme:sales", subject_id="ou_1")
     assert rows[0].kind == "inbound"
     assert rows[0].metadata == expected
+
+
+async def test_empty_backend_token_omits_authorization_header(store: Store) -> None:
+    """A missing/empty token must not produce an illegal ``Bearer `` header."""
+    add_backend(store, tenant_id="acme", token_ref="")
+    backend = FakeBackend(static_handler(frame(1, "completed")))
+    processor = build_processor(store, http_client_factory=backend.client_factory())
+
+    events = await collect(processor, make_message())
+
+    assert event_types(events) == [MessageEventType.COMPLETED]
+    request = backend.calls[0]
+    assert "authorization" not in request.headers

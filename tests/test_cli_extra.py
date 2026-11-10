@@ -36,6 +36,7 @@ runner = CliRunner()
 class FakeBackend:
     def __init__(self) -> None:
         self.routes: dict[tuple[str, str], tuple[int, Any, bytes | None]] = {}
+        self.sequences: dict[tuple[str, str], list[tuple[int, Any]]] = {}
         self.requests: list[httpx.Request] = []
 
     def route(
@@ -49,9 +50,16 @@ class FakeBackend:
     ) -> None:
         self.routes[(method.upper(), path)] = (status_code, payload, content)
 
+    def route_sequence(self, method: str, path: str, responses: list[tuple[int, Any]]) -> None:
+        self.sequences[(method.upper(), path)] = list(responses)
+
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         key = (request.method.upper(), request.url.path)
+        sequence = self.sequences.get(key)
+        if sequence:
+            status_code, payload = sequence.pop(0)
+            return httpx.Response(status_code, json=payload)
         if key not in self.routes:
             return httpx.Response(404, json={"detail": f"unexpected route {key[0]} {key[1]}"})
         status_code, payload, content = self.routes[key]
@@ -341,60 +349,93 @@ def test_run_command_delegates_to_daemon(monkeypatch: pytest.MonkeyPatch) -> Non
     assert calls == [{"host": "127.0.0.1", "port": 9999}]
 
 
-def test_channel_ls_empty_list(backend: FakeBackend) -> None:
-    backend.route("GET", "/v1/channels", {"channels": []})
-    result = invoke("channel", "ls")
+def test_run_dev_command_delegates_with_dev_backend(monkeypatch: pytest.MonkeyPatch) -> None:
+    from im_gateway.gateway import app as gateway_app
+
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(gateway_app, "run_daemon", lambda **kwargs: calls.append(kwargs))
+    result = invoke("run-dev", "--dev-backend-port", "9911")
     assert result.exit_code == 0, result.stderr
-    assert "(no channels" in result.stdout
+    assert calls == [
+        {
+            "host": "127.0.0.1",
+            "port": 8765,
+            "dev_backend": True,
+            "dev_backend_port": 9911,
+        }
+    ]
 
 
-def test_channel_show_json(backend: FakeBackend) -> None:
+def test_channel_list_empty(backend: FakeBackend) -> None:
+    backend.route("GET", "/v1/channels", {"channels": []})
+    result = invoke("channel", "list")
+    assert result.exit_code == 0, result.stderr
+    assert "(no channels" in result.stderr
+    assert result.stdout == ""
+
+
+def test_channel_list_detail_json(backend: FakeBackend) -> None:
     backend.route(
         "GET",
         "/v1/channels/sales",
         {"channel_id": "feishu:acme:sales", "kind": "feishu", "state": "running"},
     )
-    result = invoke("--json", "channel", "show", "sales")
+    result = invoke("--json", "channel", "list", "sales")
     assert result.exit_code == 0, result.stderr
     assert json.loads(result.stdout)["channel_id"] == "feishu:acme:sales"
 
 
-def test_channel_add_json(backend: FakeBackend) -> None:
+def test_channel_login_silent_json(backend: FakeBackend) -> None:
     backend.route("POST", "/v1/channels", {"channel_id": "cli:added", "state": "running"})
-    result = invoke("--json", "channel", "add", "feishu", "--id", "cli:added", "--config", "app_id=cli")
+    result = invoke(
+        "--json",
+        "channel",
+        "login",
+        "feishu",
+        "--id",
+        "cli:added",
+        "--config",
+        "app_id=cli",
+        "--app-secret",
+        "s",
+    )
     assert result.exit_code == 0, result.stderr
-    assert json.loads(result.stdout)["channel_id"] == "cli:added"
+    payload = json.loads(result.stdout)
+    assert payload["event"] == "result"
+    assert payload["channel_id"] == "cli:added"
     body = json.loads(backend.recorded("POST", "/v1/channels").content)
-    assert body["config"] == {"app_id": "cli"}
+    assert body["config"] == {"app_id": "cli", "app_secret": "s"}
 
 
-def test_channel_rm_json_with_yes(backend: FakeBackend) -> None:
-    backend.route("DELETE", "/v1/channels/sales", {"deleted": True})
-    result = invoke("--json", "channel", "rm", "sales", "--yes", "--purge")
+def test_channel_logout_json(backend: FakeBackend) -> None:
+    backend.route("PATCH", "/v1/channels/sales", {"channel_id": "feishu:acme:sales"})
+    result = invoke("--json", "channel", "logout", "sales")
     assert result.exit_code == 0, result.stderr
-    assert json.loads(result.stdout) == {"deleted": True}
+    assert json.loads(result.stdout)["channel_id"] == "feishu:acme:sales"
+    body = json.loads(backend.recorded("PATCH", "/v1/channels/sales").content)
+    assert body == {"enabled": False}
+
+
+def test_channel_delete_json_with_yes(backend: FakeBackend) -> None:
+    backend.route("GET", "/v1/channels/sales", {"channel_id": "feishu:acme:sales", "enabled": False})
+    backend.route("DELETE", "/v1/channels/sales", {"deleted": True, "purged": True})
+    result = invoke("--json", "channel", "delete", "sales", "--yes", "--purge")
+    assert result.exit_code == 0, result.stderr
+    assert json.loads(result.stdout) == {"deleted": True, "purged": True}
     params = dict(backend.recorded("DELETE", "/v1/channels/sales").url.params)
     assert params == {"purge": "true"}
 
 
-def test_channel_rm_interactive_confirmation_accepted(
+def test_channel_delete_interactive_confirmation_accepted(
     backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    backend.route("DELETE", "/v1/channels/sales", {"deleted": True})
+    backend.route("GET", "/v1/channels/sales", {"channel_id": "feishu:acme:sales", "enabled": False})
+    backend.route("DELETE", "/v1/channels/sales", {"deleted": True, "channel_id": "feishu:acme:sales"})
     monkeypatch.setattr(cli, "sys", SimpleNamespace(stdin=SimpleNamespace(isatty=lambda: True)))
     monkeypatch.setattr(cli.typer, "confirm", lambda *args, **kwargs: True)
-    result = invoke("channel", "rm", "sales")
+    result = invoke("channel", "delete", "sales")
     assert result.exit_code == 0, result.stderr
-    assert "deleted channel sales" in result.stdout
-
-
-def test_channel_enable_json(backend: FakeBackend) -> None:
-    backend.route("PATCH", "/v1/channels/sales", {"channel_id": "feishu:acme:sales"})
-    result = invoke("--json", "channel", "enable", "sales")
-    assert result.exit_code == 0, result.stderr
-    assert json.loads(result.stdout)["channel_id"] == "feishu:acme:sales"
-    body = json.loads(backend.recorded("PATCH", "/v1/channels/sales").content)
-    assert body == {"enabled": True}
+    assert "deleted: feishu:acme:sales" in result.stderr
 
 
 def test_channel_test_json(backend: FakeBackend) -> None:
@@ -407,86 +448,130 @@ def test_channel_test_json(backend: FakeBackend) -> None:
 def test_channel_login_timeout_must_be_positive(backend: FakeBackend) -> None:
     result = invoke("channel", "login", "sales", "--timeout", "0")
     assert result.exit_code == 1
-    assert "--timeout must be positive" in result.stderr
+    assert "必须为正数" in result.stderr
 
 
-def test_channel_login_confirmed_renders_qr(backend: FakeBackend) -> None:
+def _login_routes(backend: FakeBackend, *, final_state: str = "running") -> None:
+    """Wire the GET/POST/GET sequence one QR login run performs.
+
+    The resolve call uses the CLI ref (``sales``); the login endpoints use the
+    canonical channel_id the daemon returned (``feishu:acme:sales``).
+    """
     backend.route(
-        "POST",
-        "/v1/channels/sales/login",
+        "GET",
+        "/v1/channels/sales",
         {
-            "session_id": "session-1",
-            "status": "confirmed",
-            "qr_content": "https://example.com/login?token=abc",
+            "channel_id": "feishu:acme:sales",
+            "login_supported": True,
+            "credentials": {"configured": False},
         },
     )
+    backend.route(
+        "POST",
+        "/v1/channels/feishu:acme:sales/login",
+        {"session_id": "session-1", "status": "pending", "qr_content": "https://example.com/qr"},
+    )
+    backend.route(
+        "GET",
+        "/v1/channels/feishu:acme:sales/login/session-1",
+        {"session_id": "session-1", "status": "confirmed"},
+    )
+    backend.route(
+        "GET",
+        "/v1/channels/feishu:acme:sales",
+        {
+            "channel_id": "feishu:acme:sales",
+            "login_supported": True,
+            "state": final_state,
+        },
+    )
+
+
+def test_channel_login_confirmed_renders_qr(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli.time, "sleep", lambda seconds: None)
+    _login_routes(backend)
     result = invoke("channel", "login", "sales")
     assert result.exit_code == 0, result.stderr
     assert "█" in result.stdout  # terminal QR art
-    assert "login confirmed: sales" in result.stdout
+    assert "login confirmed: feishu:acme:sales" in result.stderr
 
 
 def test_channel_login_json_polls_until_confirmed(
     backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(cli.time, "sleep", lambda seconds: None)
-    backend.route(
-        "POST",
-        "/v1/channels/sales/login",
-        {"session_id": "session-1", "status": "pending", "qr_content": "https://example.com/qr"},
-    )
-    backend.route(
-        "GET",
-        "/v1/channels/sales/login/session-1",
-        {"session_id": "session-1", "status": "confirmed"},
-    )
+    _login_routes(backend)
     result = invoke("--json", "channel", "login", "sales")
     assert result.exit_code == 0, result.stderr
-    assert '"status": "confirmed"' in result.stdout
+    assert '"status":"confirmed"' in result.stdout
 
 
-def test_channel_login_times_out_and_cancels(backend: FakeBackend, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_channel_login_times_out_and_cancels(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(cli.time, "sleep", lambda seconds: None)
     backend.route(
+        "GET",
+        "/v1/channels/sales",
+        {
+            "channel_id": "feishu:acme:sales",
+            "login_supported": True,
+            "credentials": {"configured": False},
+        },
+    )
+    backend.route(
         "POST",
-        "/v1/channels/sales/login",
+        "/v1/channels/feishu:acme:sales/login",
         {"session_id": "session-1", "status": "pending", "qr_content": "https://example.com/qr"},
     )
     backend.route(
         "GET",
-        "/v1/channels/sales/login/session-1",
+        "/v1/channels/feishu:acme:sales/login/session-1",
         {"session_id": "session-1", "status": "pending"},
     )
-    backend.route("DELETE", "/v1/channels/sales/login/session-1", {"cancelled": True})
+    backend.route(
+        "DELETE", "/v1/channels/feishu:acme:sales/login/session-1", {"cancelled": True}
+    )
     result = invoke("channel", "login", "sales", "--timeout", "0.001")
     assert result.exit_code == 1
     assert "timed out" in result.stderr
-    assert backend.recorded("DELETE", "/v1/channels/sales/login/session-1") is not None
+    assert backend.recorded("DELETE", "/v1/channels/feishu:acme:sales/login/session-1") is not None
 
 
 def test_channel_login_reports_non_pending_status(
     backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setattr(cli.time, "sleep", lambda seconds: None)
+    backend.route(
+        "GET",
+        "/v1/channels/sales",
+        {
+            "channel_id": "feishu:acme:sales",
+            "login_supported": True,
+            "credentials": {"configured": False},
+        },
+    )
     backend.route(
         "POST",
-        "/v1/channels/sales/login",
-        {
-            "session_id": "session-1",
-            "status": "expired",
-            "message": "session gone",
-            "qr_content": "https://example.com/qr",
-        },
+        "/v1/channels/feishu:acme:sales/login",
+        {"session_id": "session-1", "status": "expired", "message": "session gone", "qr_content": "https://example.com/qr"},
     )
     result = invoke("channel", "login", "sales")
     assert result.exit_code == 1
     assert "login expired: session gone" in result.stderr
 
 
-def test_render_login_qr_fallbacks(capsys: pytest.CaptureFixture[str]) -> None:
-    cli._render_login_qr({"qr_image_url": "https://example.com/qr.png"})
-    assert "QR image: https://example.com/qr.png" in capsys.readouterr().out
+def test_emit_login_challenge_encodes_image_url(capsys: pytest.CaptureFixture[str]) -> None:
+    # WeChat only returns a page URL (qr_image_url): it must be *encoded* as the
+    # QR payload, not downloaded as a bitmap.
+    cli._emit_login_challenge({"qr_image_url": "https://example.com/bind"}, "both")
+    out = capsys.readouterr().out
+    assert "URL: https://example.com/bind" in out
+    assert "\u2588" in out
     with pytest.raises(typer.Exit):
-        cli._render_login_qr({})
+        cli._emit_login_challenge({}, "both")
 
 
 def test_start_wait_polls_ready(backend: FakeBackend, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -546,13 +631,26 @@ def test_wait_ready_retries_then_succeeds(
 
 def test_channel_login_json_reports_error_status(backend: FakeBackend) -> None:
     backend.route(
+        "GET",
+        "/v1/channels/sales",
+        {
+            "channel_id": "feishu:acme:sales",
+            "login_supported": True,
+            "credentials": {"configured": False},
+        },
+    )
+    backend.route(
         "POST",
-        "/v1/channels/sales/login",
-        {"session_id": "session-1", "status": "expired"},
+        "/v1/channels/feishu:acme:sales/login",
+        {
+            "session_id": "session-1",
+            "status": "expired",
+            "qr_content": "https://example.com/qr",
+        },
     )
     result = invoke("--json", "channel", "login", "sales")
     assert result.exit_code == 1
-    assert '"status": "expired"' in result.stdout
+    assert '"status":"expired"' in result.stdout
 
 
 def test_subject_ls_empty(backend: FakeBackend) -> None:

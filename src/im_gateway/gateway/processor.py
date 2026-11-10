@@ -133,12 +133,22 @@ class BackendRouter:
     the operator sees the configured-but-missing env var in the request.
     """
 
-    def __init__(self, store: Store, *, env: Mapping[str, str] | None = None) -> None:
+    def __init__(
+        self,
+        store: Store,
+        *,
+        env: Mapping[str, str] | None = None,
+        override: BackendSpec | None = None,
+    ) -> None:
         self._store = store
         self._env: Mapping[str, str] = os.environ if env is None else env
+        #: Dev mode: route every tenant to this backend instead of the DB rows.
+        self._override = override
 
     def resolve(self, tenant_id: str | None) -> BackendSpec | None:
         """Return the backend for *tenant_id*, falling back to the default one."""
+        if self._override is not None:
+            return self._override
         lookup = tenant_id or ""
         record = self._store.get_backend(lookup)
         if record is None and lookup:
@@ -341,14 +351,18 @@ class TurnProcessor:
 
         async with client_factory() as client:
             async with asyncio.timeout(deadline_ms / 1000):
+                request_headers: dict[str, str] = {
+                    "Accept": "text/event-stream",
+                    "Content-Type": "application/json",
+                }
+                if spec.token:
+                    # An empty token (e.g. `${ENV}` not set) must omit the header:
+                    # httpx rejects a literal "Bearer " as an illegal header value.
+                    request_headers["Authorization"] = f"Bearer {spec.token}"
                 async with client.stream(
                     "POST",
                     f"{spec.base_url}{_TURNS_PATH}",
-                    headers={
-                        "Authorization": f"Bearer {spec.token}",
-                        "Accept": "text/event-stream",
-                        "Content-Type": "application/json",
-                    },
+                    headers=request_headers,
                     content=start.model_dump_json(),
                 ) as response:
                     if response.status_code != 200:
@@ -621,6 +635,7 @@ def build_processor(
     *,
     events: EventBus | None = None,
     http_client_factory: Callable[[], httpx.AsyncClient] | None = None,
+    dev_backend: BackendSpec | None = None,
 ) -> TurnProcessor:
     """Build the production processor from SQLite settings (HANDOVER §13.2).
 
@@ -637,7 +652,7 @@ def build_processor(
     )
     return TurnProcessor(
         store,
-        BackendRouter(store),
+        BackendRouter(store, override=dev_backend),
         events=events,
         http_client_factory=http_client_factory,
         error_texts=error_texts,

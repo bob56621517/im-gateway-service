@@ -224,3 +224,6 @@ pytest-of-*/
 *.db
 *.db-wal
 *.db-shm
+
+# live smoke-test state (temp DB, token, QR images)
+.smoke/

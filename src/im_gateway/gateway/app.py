@@ -42,10 +42,12 @@ from im_gateway.core.config import (
     ChannelConfigEntry,
     ConfigDocument,
 )
+from im_gateway.core.credentials import credential_status
 from im_gateway.db.models import ChannelRecord, MessageRecord
 from im_gateway.db.store import Store
-from im_gateway.gateway.login import LoginManager
+from im_gateway.gateway.login import SUPPORTED_LOGIN_KINDS, LoginManager
 from im_gateway.gateway.maintenance import RetentionScheduler
+from im_gateway.gateway.processor import BackendSpec
 from im_gateway.gateway.runtime import GatewayRuntime
 
 __all__ = ["create_app", "run_daemon"]
@@ -116,9 +118,22 @@ def _resolve_channel(store: Store, ref: str) -> ChannelRecord:
     return record
 
 
-def _channel_view(runtime: GatewayRuntime, record: ChannelRecord) -> dict[str, Any]:
+def _channel_view(
+    runtime: GatewayRuntime,
+    record: ChannelRecord,
+    *,
+    include_config: bool = False,
+) -> dict[str, Any]:
+    """Serialize one channel for the control plane.
+
+    ``include_config`` is only used by the single-channel endpoint: list/status
+    responses stay small, and **every** config copy is masked here so no
+    endpoint can leak a literal secret (HANDOVER §13.5).  ``credentials`` is a
+    field-name-only readiness summary (``app_id`` etc. are identifiers, not
+    secrets; ``app_secret`` never appears as a value).
+    """
     state, last_error = runtime.channel_state(record.channel_id)
-    return {
+    view: dict[str, Any] = {
         "channel_id": record.channel_id,
         "kind": record.kind,
         "tenant_id": record.tenant_id,
@@ -127,10 +142,15 @@ def _channel_view(runtime: GatewayRuntime, record: ChannelRecord) -> dict[str, A
         "enabled": record.enabled,
         "state": state,
         "last_error": last_error,
+        "login_supported": record.kind in SUPPORTED_LOGIN_KINDS,
+        "credentials": credential_status(record.kind, record.config),
         "capabilities": capabilities_for(record.kind).model_dump(),
         "created_at": record.created_at,
         "last_started_at": record.last_started_at,
     }
+    if include_config:
+        view["config"] = _mask_secrets(dict(record.config))
+    return view
 
 
 def _message_view(record: MessageRecord) -> dict[str, Any]:
@@ -291,6 +311,7 @@ def create_app(
     runtime: GatewayRuntime | None = None,
     token: str,
     manager: Any | None = None,
+    dev_backend: BackendSpec | None = None,
 ) -> FastAPI:
     """Build the control-plane ASGI app.
 
@@ -298,7 +319,11 @@ def create_app(
     around ``store``.  ``manager`` is only used when the runtime is built here,
     which is how tests inject a fake upstream manager.
     """
-    active_runtime = runtime if runtime is not None else GatewayRuntime(store, token=token, manager=manager)
+    active_runtime = (
+        runtime
+        if runtime is not None
+        else GatewayRuntime(store, token=token, manager=manager, dev_backend=dev_backend)
+    )
     scheduler = RetentionScheduler(store)
     login_manager = LoginManager(active_runtime)
 
@@ -432,12 +457,12 @@ def create_app(
         record = store.get_channel(entry.channel_id)
         if record is None:  # pragma: no cover - add_channel inserts before returning
             raise KeyError(entry.channel_id)
-        return _channel_view(active_runtime, record)
+        return _channel_view(active_runtime, record, include_config=True)
 
     @app.get("/v1/channels/{ref}")
     async def get_channel(ref: str) -> dict[str, Any]:
         record = _resolve_channel(store, ref)
-        return _channel_view(active_runtime, record)
+        return _channel_view(active_runtime, record, include_config=True)
 
     @app.patch("/v1/channels/{ref}")
     async def update_channel(ref: str, payload: ChannelUpdate) -> dict[str, Any]:
@@ -447,11 +472,19 @@ def create_app(
         updated = store.get_channel(record.channel_id)
         if updated is None:  # pragma: no cover - update cannot delete the row
             raise KeyError(record.channel_id)
-        return _channel_view(active_runtime, updated)
+        return _channel_view(active_runtime, updated, include_config=True)
 
     @app.delete("/v1/channels/{ref}")
     async def remove_channel(ref: str, purge: bool = False) -> dict[str, Any]:
         record = _resolve_channel(store, ref)
+        if record.enabled:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"通道 {record.channel_id!r} 仍处于登录状态，请先执行 "
+                    f"`imgw channel logout {record.channel_id}` 再删除"
+                ),
+            )
         await active_runtime.remove_channel(ref, purge=purge)
         return {"deleted": True, "channel_id": record.channel_id, "purged": purge}
 
@@ -459,7 +492,7 @@ def create_app(
     async def list_subjects(ref: str) -> dict[str, Any]:
         return {"subjects": active_runtime.list_subjects(ref)}
 
-    # -- QR login (QQ / Weixin; HANDOVER §13.7, §11.4) ------------------------
+    # -- QR login (feishu / wecom / dingtalk / qq / weixin; HANDOVER §13.7) ---
     @app.post("/v1/channels/{ref}/login")
     async def start_login(ref: str) -> dict[str, Any]:
         return await login_manager.begin(ref)
@@ -579,24 +612,72 @@ def run_daemon(
     port: int | None = None,
     listen: str | None = None,
     db: str | None = None,
+    dev_backend: bool = False,
+    dev_backend_port: int = 9900,
 ) -> None:
     """Run the control plane in the foreground (``imgw run``).
 
-    This is deliberately the only function that starts a server; signal
-    handling and graceful shutdown are uvicorn's/FastAPI's job (lifespan).
+    With ``dev_backend=True`` an in-process echo backend (``im_gateway.dev``)
+    is started on ``127.0.0.1:{dev_backend_port}`` and **every tenant** is routed
+    to it instead of the ``backends`` table, so channel connectivity can be
+    debugged without writing any backend config.
     """
+    import threading
+    import time
+
     import uvicorn
 
     token = paths.load_or_create_token()
     db_path = Path(db) if db is not None else paths.default_db_path()
     store = Store(db_path)
-    app = create_app(store=store, token=token)
-    address = _parse_listen_address(listen=listen, host=host, port=port)
-    if address.uds is not None:
-        uvicorn.run(app, uds=str(address.uds))
-    else:
-        uvicorn.run(
-            app,
-            host=address.host or _DEFAULT_TCP_HOST,
-            port=address.port or _DEFAULT_TCP_PORT,
+
+    dev_server: Any | None = None
+    dev_spec: BackendSpec | None = None
+    if dev_backend:
+        from im_gateway.dev.backend import create_dev_backend_app
+
+        dev_config = uvicorn.Config(
+            create_dev_backend_app(),
+            host="127.0.0.1",
+            port=int(dev_backend_port),
+            log_level="info",
         )
+        dev_server = uvicorn.Server(dev_config)
+        # Running in a helper thread: uvicorn cannot install signal handlers there.
+        dev_server_any: Any = dev_server
+        dev_server_any.install_signal_handlers = lambda: None  # non-main thread: no signal handlers
+        thread = threading.Thread(target=dev_server.run, name="imgw-dev-backend", daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 10.0
+        while not dev_server.started and time.monotonic() < deadline:
+            if not thread.is_alive():
+                raise RuntimeError(f"dev backend failed to start on 127.0.0.1:{dev_backend_port}")
+            time.sleep(0.05)
+        if not dev_server.started:
+            raise RuntimeError(f"dev backend did not start on 127.0.0.1:{dev_backend_port}")
+        dev_spec = BackendSpec(
+            tenant_id="",
+            base_url=f"http://127.0.0.1:{int(dev_backend_port)}",
+            token="",
+            timeout_ms=120_000,
+            enabled=True,
+        )
+        logger.info(
+            "dev backend listening on http://127.0.0.1:%s (all tenants routed here)",
+            dev_backend_port,
+        )
+
+    app = create_app(store=store, token=token, dev_backend=dev_spec)
+    address = _parse_listen_address(listen=listen, host=host, port=port)
+    try:
+        if address.uds is not None:
+            uvicorn.run(app, uds=str(address.uds))
+        else:
+            uvicorn.run(
+                app,
+                host=address.host or _DEFAULT_TCP_HOST,
+                port=address.port or _DEFAULT_TCP_PORT,
+            )
+    finally:
+        if dev_server is not None:
+            dev_server.should_exit = True

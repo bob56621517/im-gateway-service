@@ -37,7 +37,7 @@ from im_gateway.db.models import BackendRecord, ChannelRecord, MessageRecord
 from im_gateway.db.store import Store
 from im_gateway.gateway.events import EventBus
 from im_gateway.gateway.factory import build_config, constraints_of
-from im_gateway.gateway.processor import build_processor
+from im_gateway.gateway.processor import BackendSpec, build_processor
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from octop_gateway.channel import MessageProcessor
@@ -151,9 +151,12 @@ class GatewayRuntime:
         manager: Any | None = None,
         processor: MessageProcessor | None = None,
         media_dir: Path | None = None,
+        dev_backend: BackendSpec | None = None,
     ) -> None:
         self.store = store
         self.token = token
+        #: Dev mode: route every turn to this backend (``imgw run --dev-backend``).
+        self._dev_backend = dev_backend
         self.media_dir = Path(media_dir) if media_dir is not None else paths.default_media_dir()
         self.events = EventBus()
         #: Warnings from the most recent :meth:`apply_config` call.
@@ -215,7 +218,11 @@ class GatewayRuntime:
         self.events.bind_loop(asyncio.get_running_loop())
         if self._processor is None:
             # Reads settings -> must happen after migrate().
-            self._processor = build_processor(self.store, events=self.events)
+            self._processor = build_processor(
+                self.store,
+                events=self.events,
+                dev_backend=self._dev_backend,
+            )
         if self._manager is None:
             self._manager = self._build_manager()
         self._started = True
@@ -412,6 +419,26 @@ class GatewayRuntime:
             raise
         self._audit("channel.add", record.channel_id, {"kind": record.kind, "enabled": True})
 
+    async def persist_login_credentials(self, channel_id: str, config: dict[str, Any]) -> None:
+        """Persist credentials from a QR login before trying to start the channel.
+
+        A transient registration failure (e.g. the freshly created Feishu app has
+        not been published/approved yet) must **not** discard just-scanned
+        credentials: store them with ``enabled=False`` first, then let the caller
+        attempt enable separately.  The channel stays disabled on failure and can
+        be reconnected with ``imgw channel login <ref>`` later.
+        """
+        record = self._require_channel(channel_id)
+        merged = {**record.config, **config}
+        await self._unregister(channel_id)
+        self.store.update_channel(channel_id, config=merged, enabled=False)
+        self._set_state(channel_id, STATE_DISABLED)
+        self._audit(
+            "channel.login",
+            channel_id,
+            {"kind": record.kind, "status": "credentials_saved"},
+        )
+
     async def update_channel(self, ref: str, fields: dict[str, Any]) -> None:
         """Apply a PATCH.
 
@@ -433,6 +460,14 @@ class GatewayRuntime:
             raise ValueError("kind 必须是字符串")
         if not isinstance(new_config, dict):
             raise ValueError("config 必须是 JSON 对象")
+        if "config" in fields:
+            # PATCH config is a *partial* update: ``"***"`` keeps the stored value
+            # (same rule as config import, HANDOVER §13.4) and keys not mentioned
+            # are preserved.  A masked value with no old value is a hard error.
+            resolved = _resolve_masked(new_config, record.config)
+            _raise_if_missing(resolved, "config")
+            new_config = {**record.config, **resolved}
+            fields["config"] = new_config
         if not isinstance(new_constraints, dict):
             raise ValueError("constraints 必须是 JSON 对象")
         build_config(new_kind, new_config)

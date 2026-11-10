@@ -41,6 +41,7 @@ class FakeBackend:
 
     def __init__(self) -> None:
         self.routes: dict[tuple[str, str], tuple[int, Any, bytes | None]] = {}
+        self.sequences: dict[tuple[str, str], list[tuple[int, Any]]] = {}
         self.requests: list[httpx.Request] = []
 
     def route(
@@ -54,9 +55,22 @@ class FakeBackend:
     ) -> None:
         self.routes[(method.upper(), path)] = (status_code, payload, content)
 
+    def route_sequence(
+        self,
+        method: str,
+        path: str,
+        responses: list[tuple[int, Any]],
+    ) -> None:
+        """Serve different responses for repeated calls to the same route."""
+        self.sequences[(method.upper(), path)] = list(responses)
+
     def handle(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
         key = (request.method.upper(), request.url.path)
+        sequence = self.sequences.get(key)
+        if sequence:
+            status_code, payload = sequence.pop(0)
+            return httpx.Response(status_code, json=payload)
         if key not in self.routes:
             return httpx.Response(404, json={"detail": f"unexpected route {key[0]} {key[1]}"})
         status_code, payload, content = self.routes[key]
@@ -97,6 +111,12 @@ def channel_view(channel_id: str = "feishu:acme:sales", **overrides: Any) -> dic
         "enabled": True,
         "state": "running",
         "last_error": None,
+        "login_supported": True,
+        "credentials": {
+            "configured": True,
+            "required": ["app_id", "app_secret"],
+            "missing": [],
+        },
         "capabilities": {
             "streaming": "buffered",
             "markdown": "native",
@@ -284,152 +304,308 @@ def test_ready_not_ready(backend: FakeBackend) -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_channel_ls_table(backend: FakeBackend) -> None:
+def test_channel_list_tsv(backend: FakeBackend) -> None:
     backend.route(
         "GET",
         "/v1/channels",
-        {"channels": [channel_view(alias="sales"), channel_view("wecom:acme:ops", kind="wecom")]},
+        {
+            "channels": [
+                channel_view(alias="sales"),
+                channel_view(
+                    "wecom:acme:ops",
+                    kind="wecom",
+                    credentials={
+                        "configured": False,
+                        "required": ["bot_id", "secret"],
+                        "missing": ["bot_id", "secret"],
+                    },
+                ),
+            ]
+        },
     )
-    result = runner.invoke(cli.app, ["channel", "ls"])
+    result = runner.invoke(cli.app, ["channel", "list"])
     assert result.exit_code == 0, result.stderr
-    assert "feishu:acme:sales" in result.stdout
-    assert "wecom:acme:ops" in result.stdout
-    assert "sales" in result.stdout
+    lines = result.stdout.rstrip("\n").split("\n")
+    assert lines[0].split("\t") == ["channel_id", "kind", "state", "creds", "alias"]
+    assert lines[1].split("\t") == ["feishu:acme:sales", "feishu", "running", "ok", "sales"]
+    assert lines[2].split("\t") == ["wecom:acme:ops", "wecom", "running", "missing", "-"]
 
 
-def test_channel_ls_hides_disabled_unless_all(backend: FakeBackend) -> None:
+def test_channel_list_includes_disabled_and_header(backend: FakeBackend) -> None:
     backend.route(
         "GET",
         "/v1/channels",
-        {"channels": [channel_view(), channel_view("feishu:acme:old", enabled=False)]},
+        {"channels": [channel_view(), channel_view("feishu:acme:old", enabled=False, state="disabled")]},
     )
-    default_result = runner.invoke(cli.app, ["channel", "ls"])
-    assert default_result.exit_code == 0, default_result.stderr
-    assert "feishu:acme:old" not in default_result.stdout
+    plain = runner.invoke(cli.app, ["channel", "list"])
+    assert plain.exit_code == 0, plain.stderr
+    assert "feishu:acme:old" in plain.stdout  # disabled channels are shown by default
+    assert plain.stdout.split("\n")[0] == "channel_id\tkind\tstate\tcreds\talias"
+    bare = runner.invoke(cli.app, ["channel", "list", "--no-header"])
+    assert bare.exit_code == 0, bare.stderr
+    assert bare.stdout.split("\n")[0].startswith("feishu:acme:sales\t")
 
-    all_result = runner.invoke(cli.app, ["channel", "ls", "--all"])
-    assert all_result.exit_code == 0, all_result.stderr
-    assert "feishu:acme:old" in all_result.stdout
 
-
-def test_channel_ls_json(backend: FakeBackend) -> None:
+def test_channel_list_json(backend: FakeBackend) -> None:
     backend.route("GET", "/v1/channels", {"channels": [channel_view()]})
-    result = runner.invoke(cli.app, ["channel", "ls", "--json"])
+    result = runner.invoke(cli.app, ["channel", "list", "--json"])
     assert result.exit_code == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload["channels"][0]["channel_id"] == "feishu:acme:sales"
 
 
-def test_channel_show(backend: FakeBackend) -> None:
-    backend.route("GET", "/v1/channels/feishu:acme:sales", channel_view(alias="sales", name="Sales"))
-    result = runner.invoke(cli.app, ["channel", "show", "feishu:acme:sales"])
+def test_channel_list_detail_masks_secrets(backend: FakeBackend) -> None:
+    backend.route(
+        "GET",
+        "/v1/channels/feishu:acme:sales",
+        channel_view(
+            alias="sales",
+            config={
+                "app_id": "cli_x",
+                "app_secret": "***",
+                "nested": {"token": "***"},
+            },
+        ),
+    )
+    result = runner.invoke(cli.app, ["channel", "list", "feishu:acme:sales"])
     assert result.exit_code == 0, result.stderr
-    assert "channel_id      feishu:acme:sales" in result.stdout
-    assert "state           running" in result.stdout
-    assert "Sales" in result.stdout
+    assert "channel_id\tfeishu:acme:sales" in result.stdout
+    assert "state\trunning" in result.stdout
+    assert "credentials\tok" in result.stdout
+    assert "config.app_id\tcli_x" in result.stdout
+    assert "config.app_secret\t***" in result.stdout
+    assert "config.nested.token\t***" in result.stdout
 
 
-def test_channel_add_posts_parsed_entry(backend: FakeBackend) -> None:
-    backend.route("POST", "/v1/channels", channel_view(), status_code=201)
+def test_terminal_qr_encoding_fallback() -> None:
+    # Windows consoles default to GBK and cannot encode the half-block QR art.
+    assert cli._stdout_can_encode("\u2580", encoding="utf-8") is True
+    assert cli._stdout_can_encode("\u2580", encoding="gbk") is False
+    assert cli._stdout_can_encode("URL: https://example.com", encoding="gbk") is True
+
+
+def test_channel_login_silent_registers_new_channel(backend: FakeBackend) -> None:
+    backend.route("POST", "/v1/channels", channel_view())
     result = runner.invoke(
         cli.app,
         [
             "channel",
-            "add",
+            "login",
             "feishu",
             "--id",
             "feishu:acme:sales",
-            "--tenant",
-            "acme",
-            "--alias",
-            "sales",
             "--name",
-            "Sales",
-            "--config",
-            "app_id=cli_x",
-            "--config",
-            "debug=true",
-            "--config",
-            "retries=3",
+            "sales",
+            "--app-id",
+            "cli_x",
+            "--app-secret",
+            "sekret",
         ],
     )
     assert result.exit_code == 0, result.stderr
-    request = backend.recorded("POST", "/v1/channels")
-    body = json.loads(request.content)
+    body = json.loads(backend.recorded("POST", "/v1/channels").content)
     assert body["channel_id"] == "feishu:acme:sales"
     assert body["kind"] == "feishu"
-    assert body["tenant_id"] == "acme"
     assert body["alias"] == "sales"
-    assert body["name"] == "Sales"
+    assert body["name"] == "sales"
     assert body["enabled"] is True
-    assert body["config"] == {"app_id": "cli_x", "debug": True, "retries": 3}
-    assert body["constraints"] == {}
-    assert "added channel feishu:acme:sales" in result.stdout
+    assert body["config"] == {"app_id": "cli_x", "app_secret": "sekret"}
+    assert "logged in" in result.stderr
 
 
-def test_channel_add_disabled_flag(backend: FakeBackend) -> None:
-    backend.route("POST", "/v1/channels", channel_view(enabled=False), status_code=201)
-    result = runner.invoke(cli.app, ["channel", "add", "feishu", "--id", "x", "--disabled"])
-    assert result.exit_code == 0, result.stderr
-    body = json.loads(backend.recorded("POST", "/v1/channels").content)
-    assert body["enabled"] is False
-
-
-def test_channel_add_with_check_probes_first(backend: FakeBackend) -> None:
+def test_channel_login_check_probes_before_create(backend: FakeBackend) -> None:
     backend.route("POST", "/v1/channels/probe", {"ok": True})
-    backend.route("POST", "/v1/channels", channel_view(), status_code=201)
+    backend.route("POST", "/v1/channels", channel_view())
     result = runner.invoke(
         cli.app,
-        ["channel", "add", "feishu", "--id", "feishu:acme:sales", "--config", "app_id=x", "--check"],
+        [
+            "channel",
+            "login",
+            "feishu",
+            "--id",
+            "feishu:acme:sales",
+            "--app-id",
+            "cli_x",
+            "--app-secret",
+            "s",
+            "--check",
+        ],
     )
     assert result.exit_code == 0, result.stderr
     assert [(request.method, request.url.path) for request in backend.requests] == [
+        ("GET", "/v1/channels/feishu"),
         ("POST", "/v1/channels/probe"),
         ("POST", "/v1/channels"),
     ]
-    probe_body = json.loads(backend.requests[0].content)
-    create_body = json.loads(backend.requests[1].content)
-    assert probe_body == create_body
-    assert "probe ok: feishu" in result.stdout
+    assert json.loads(backend.requests[1].content) == json.loads(backend.requests[2].content)
 
 
-def test_channel_rm_requires_yes_when_not_tty(backend: FakeBackend) -> None:
-    result = runner.invoke(cli.app, ["channel", "rm", "feishu:acme:sales"])
+def test_channel_login_new_channel_qr_writes_png(
+    backend: FakeBackend, tmp_path: Path
+) -> None:
+    backend.route("GET", "/v1/channels/feishu:acme:sales", channel_view())
+    backend.route("POST", "/v1/channels", channel_view(enabled=False, state="disabled"))
+    backend.route(
+        "POST",
+        "/v1/channels/feishu:acme:sales/login",
+        {"session_id": "s1", "status": "pending", "qr_content": "https://qr.example/x"},
+    )
+    backend.route(
+        "GET",
+        "/v1/channels/feishu:acme:sales/login/s1",
+        {"session_id": "s1", "status": "confirmed"},
+    )
+    qr_png = tmp_path / "qr.png"
+    result = runner.invoke(
+        cli.app,
+        [
+            "channel",
+            "login",
+            "feishu",
+            "--id",
+            "feishu:acme:sales",
+            "--qr-png",
+            str(qr_png),
+            "--interval",
+            "0.01",
+        ],
+    )
+    assert result.exit_code == 0, result.stderr
+    assert qr_png.read_bytes().startswith(b"\x89PNG")
+    assert "login confirmed" in result.stderr
+    assert "logged in" in result.stderr
+
+
+def test_channel_login_url_only_no_wait(backend: FakeBackend) -> None:
+    backend.route("GET", "/v1/channels/feishu:acme:sales", channel_view(credentials={"configured": False}))
+    backend.route(
+        "POST",
+        "/v1/channels/feishu:acme:sales/login",
+        {"session_id": "s1", "status": "pending", "qr_content": "https://qr.example/x"},
+    )
+    result = runner.invoke(
+        cli.app,
+        ["channel", "login", "feishu:acme:sales", "--format", "url", "--no-wait"],
+    )
+    assert result.exit_code == 0, result.stderr
+    assert result.stdout.strip() == "https://qr.example/x"
+    assert "session: s1" in result.stderr
+
+
+def test_channel_login_existing_reconnects_without_qr(backend: FakeBackend) -> None:
+    backend.route("GET", "/v1/channels/feishu:acme:sales", channel_view())
+    backend.route("PATCH", "/v1/channels/feishu:acme:sales", channel_view())
+    result = runner.invoke(cli.app, ["channel", "login", "feishu:acme:sales"])
+    assert result.exit_code == 0, result.stderr
+    assert json.loads(backend.recorded("PATCH", "/v1/channels/feishu:acme:sales").content) == {
+        "enabled": True
+    }
+    assert "logged in" in result.stderr
+
+
+def test_channel_login_existing_overwrites_credentials(backend: FakeBackend) -> None:
+    backend.route("GET", "/v1/channels/feishu:acme:sales", channel_view())
+    backend.route("PATCH", "/v1/channels/feishu:acme:sales", channel_view())
+    result = runner.invoke(
+        cli.app,
+        ["channel", "login", "feishu:acme:sales", "--app-secret", "new-secret"],
+    )
+    assert result.exit_code == 0, result.stderr
+    assert json.loads(backend.recorded("PATCH", "/v1/channels/feishu:acme:sales").content) == {
+        "config": {"app_secret": "new-secret"},
+        "enabled": True,
+    }
+
+
+def test_channel_login_rescan_forces_qr(backend: FakeBackend) -> None:
+    backend.route_sequence(
+        "GET",
+        "/v1/channels/feishu:acme:sales",
+        [(200, channel_view()), (200, channel_view())],
+    )
+    backend.route(
+        "POST",
+        "/v1/channels/feishu:acme:sales/login",
+        {"session_id": "s1", "status": "pending", "qr_content": "https://qr.example/x"},
+    )
+    backend.route(
+        "GET",
+        "/v1/channels/feishu:acme:sales/login/s1",
+        {"session_id": "s1", "status": "confirmed"},
+    )
+    result = runner.invoke(
+        cli.app, ["channel", "login", "feishu:acme:sales", "--rescan", "--interval", "0.01"]
+    )
+    assert result.exit_code == 0, result.stderr
+    assert "login confirmed" in result.stderr
+    for request in backend.requests:
+        assert request.method != "PATCH"
+
+
+def test_channel_login_missing_credentials_starts_qr(backend: FakeBackend) -> None:
+    backend.route_sequence(
+        "GET",
+        "/v1/channels/wecom:acme:ops",
+        [
+            (200, channel_view("wecom:acme:ops", kind="wecom", credentials={"configured": False})),
+            (200, channel_view("wecom:acme:ops", kind="wecom")),
+        ],
+    )
+    backend.route(
+        "POST",
+        "/v1/channels/wecom:acme:ops/login",
+        {"session_id": "s1", "status": "pending", "qr_content": "https://qr.example/w"},
+    )
+    backend.route(
+        "GET",
+        "/v1/channels/wecom:acme:ops/login/s1",
+        {"session_id": "s1", "status": "confirmed"},
+    )
+    result = runner.invoke(
+        cli.app, ["channel", "login", "wecom:acme:ops", "--interval", "0.01"]
+    )
+    assert result.exit_code == 0, result.stderr
+    assert backend.recorded("POST", "/v1/channels/wecom:acme:ops/login") is not None
+
+
+def test_channel_logout_disables(backend: FakeBackend) -> None:
+    backend.route("PATCH", "/v1/channels/feishu:acme:sales", channel_view(enabled=False, state="disabled"))
+    result = runner.invoke(cli.app, ["channel", "logout", "feishu:acme:sales"])
+    assert result.exit_code == 0, result.stderr
+    assert json.loads(backend.recorded("PATCH", "/v1/channels/feishu:acme:sales").content) == {
+        "enabled": False
+    }
+    assert "logged out" in result.stderr
+    assert "credentials and history kept" in result.stderr
+
+
+def test_channel_delete_requires_yes_when_not_tty(backend: FakeBackend) -> None:
+    result = runner.invoke(cli.app, ["channel", "delete", "feishu:acme:sales"])
     assert result.exit_code == 1
     assert "--yes" in result.stderr
     assert backend.requests == []
 
 
-def test_channel_rm_purge(backend: FakeBackend) -> None:
-    backend.route("DELETE", "/v1/channels/feishu:acme:sales", {"deleted": True})
-    result = runner.invoke(cli.app, ["channel", "rm", "feishu:acme:sales", "--purge", "--yes"])
+def test_channel_delete_requires_logout_first(backend: FakeBackend) -> None:
+    backend.route("GET", "/v1/channels/feishu:acme:sales", channel_view(enabled=True))
+    result = runner.invoke(cli.app, ["channel", "delete", "feishu:acme:sales", "--yes"])
+    assert result.exit_code == 1
+    assert "logout" in result.stderr
+    with pytest.raises(AssertionError):
+        backend.recorded("DELETE", "/v1/channels/feishu:acme:sales")
+
+
+def test_channel_delete_after_logout_purge(backend: FakeBackend) -> None:
+    backend.route("GET", "/v1/channels/feishu:acme:sales", channel_view(enabled=False, state="disabled"))
+    backend.route("DELETE", "/v1/channels/feishu:acme:sales", {"deleted": True, "purged": True})
+    result = runner.invoke(
+        cli.app, ["channel", "delete", "feishu:acme:sales", "--purge", "--yes"]
+    )
     assert result.exit_code == 0, result.stderr
     request = backend.recorded("DELETE", "/v1/channels/feishu:acme:sales")
     assert dict(request.url.params) == {"purge": "true"}
-    assert "deleted channel feishu:acme:sales" in result.stdout
-
-
-def test_channel_rm_without_purge_sends_false(backend: FakeBackend) -> None:
-    backend.route("DELETE", "/v1/channels/feishu:acme:sales", {"deleted": True})
-    result = runner.invoke(cli.app, ["channel", "rm", "feishu:acme:sales", "--yes"])
-    assert result.exit_code == 0, result.stderr
-    request = backend.recorded("DELETE", "/v1/channels/feishu:acme:sales")
-    assert dict(request.url.params) == {"purge": "false"}
-
-
-def test_channel_enable_disable_patch(backend: FakeBackend) -> None:
-    backend.route("PATCH", "/v1/channels/feishu:acme:sales", channel_view())
-    enable_result = runner.invoke(cli.app, ["channel", "enable", "feishu:acme:sales"])
-    assert enable_result.exit_code == 0, enable_result.stderr
-    assert json.loads(backend.recorded("PATCH", "/v1/channels/feishu:acme:sales").content) == {
-        "enabled": True
-    }
-
-    disable_result = runner.invoke(cli.app, ["channel", "disable", "feishu:acme:sales"])
-    assert disable_result.exit_code == 0, disable_result.stderr
-    assert json.loads(backend.recorded("PATCH", "/v1/channels/feishu:acme:sales").content) == {
-        "enabled": False
-    }
+    assert "deleted" in result.stderr
+    assert "purged" in result.stderr
 
 
 def test_channel_test_probe_ok(backend: FakeBackend) -> None:
@@ -783,8 +959,10 @@ def test_help_lists_every_command() -> None:
 def test_channel_help_lists_subcommands() -> None:
     result = runner.invoke(cli.app, ["channel", "--help"])
     assert result.exit_code == 0, result.stderr
-    for command in ("ls", "show", "add", "rm", "enable", "disable", "test"):
+    for command in ("login", "logout", "list", "delete", "test"):
         assert command in result.stdout, command
+    assert "logout" in result.stdout
+    assert "Bind" in result.stdout
 
 
 # ---------------------------------------------------------------------------

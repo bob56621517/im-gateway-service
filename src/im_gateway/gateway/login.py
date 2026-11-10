@@ -1,20 +1,22 @@
-"""QR login orchestration (QQ / Weixin).
+"""QR login orchestration (QQ / Weixin / Feishu / WeCom / DingTalk).
 
 The upstream library ships two-phase QR helpers (``QQBotQRLogin`` /
 ``WeixinQRLogin``) as *host-driven tools*: they never write credentials to disk
-and are not part of the channel lifecycle (HANDOVER §11.4).  This module owns the
-host side:
+and are not part of the channel lifecycle (HANDOVER §11.4).  For the other three
+platforms the adapters call their public scan-to-create endpoints directly
+(Feishu through ``lark_oapi.register_app``).  This module owns the host side:
 
 * one in-memory login session per attempt (status machine + TTL),
-* adapter objects that wrap the upstream helpers behind a tiny interface,
+* adapter objects that wrap the platform flow behind a tiny interface,
 * applying the confirmed credentials to the channel config through the runtime
-  (``remove_channel`` + ``add_channel`` because upstream has no update API), and
+  (``remove_channel`` + ``add_channel`` because upstream has no update API) and
+  enabling the channel (a successful scan is also a bind), and
 * auditing the result.
 
 Adapters are injectable, so the whole state machine is unit-tested offline; the
-two default adapters wrap the upstream helpers lazily (their network calls are
-only exercised on a real platform, which is explicitly out of scope for the unit
-tests).
+default adapters import their SDK/networking dependencies lazily (their network
+calls are only exercised on a real platform, which is explicitly out of scope
+for the unit tests).
 """
 
 from __future__ import annotations
@@ -22,11 +24,16 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import os
 import secrets
+import sys
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol
+
+import httpx
 
 from im_gateway.db.models import ChannelRecord
 
@@ -34,12 +41,16 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from im_gateway.gateway.runtime import GatewayRuntime
 
 __all__ = [
+    "FEISHU_LOGIN_ADDONS",
     "SUPPORTED_LOGIN_KINDS",
+    "DingTalkLoginAdapter",
+    "FeishuLoginAdapter",
     "LoginAdapter",
     "LoginChallenge",
     "LoginManager",
     "LoginPoll",
     "QQLoginAdapter",
+    "WeComLoginAdapter",
     "WeixinLoginAdapter",
     "default_adapter_factory",
 ]
@@ -47,7 +58,7 @@ __all__ = [
 logger = logging.getLogger(__name__)
 
 #: Channel kinds that have a QR binding flow.
-SUPPORTED_LOGIN_KINDS: frozenset[str] = frozenset({"qq", "weixin"})
+SUPPORTED_LOGIN_KINDS: frozenset[str] = frozenset({"qq", "weixin", "feishu", "wecom", "dingtalk"})
 #: Default lifetime of a pending login session.
 DEFAULT_SESSION_TTL_S: float = 600.0
 
@@ -199,12 +210,390 @@ class WeixinLoginAdapter:
                 await task
 
 
+# ---------------------------------------------------------------------------
+# Feishu adapter (scan to create an app; lark_oapi.register_app)
+# ---------------------------------------------------------------------------
+
+#: Scopes/events preset for a newly scanned Feishu app (HANDOVER §12.7 / §15.6).
+#: ``register_app`` validates this payload before appending it to the QR URL, so
+#: an invalid shape fails fast instead of producing a half-configured app.
+FEISHU_LOGIN_ADDONS: dict[str, Any] = {
+    "scopes": {
+        "tenant": [
+            "im:message:send_as_bot",
+            "im:message.p2p_msg:readonly",
+            "im:message.group_at_msg:readonly",
+        ]
+    },
+    "events": {"items": {"tenant": ["im.message.receive_v1"]}},
+}
+
+_FEISHU_APP_PRESET: dict[str, Any] = {"desc": "由 im-gateway 扫码创建"}
+
+
+def _feishu_default_register(**kwargs: Any) -> dict[str, Any]:
+    """Call ``lark_oapi.register_app`` (imported lazily: the SDK is heavy)."""
+    import lark_oapi  # type: ignore[import-untyped]
+
+    result: dict[str, Any] = lark_oapi.register_app(**kwargs)
+    return result
+
+
+def _feishu_warm_import() -> None:
+    """Import ``lark_oapi`` off the event loop.
+
+    The SDK imports every API module at top level; on a cold/slow filesystem that
+    can take tens of seconds.  Warming it here keeps ``start()`` from timing out
+    while it waits for the QR callback (the thread only starts afterwards).
+    """
+    __import__("lark_oapi")
+
+
+def _feishu_failure_message(exc: BaseException) -> str:
+    """Map a ``lark_oapi`` registration failure to a readable Chinese message.
+
+    ``lark_oapi`` ships no type information (and importing it just to
+    ``isinstance``-check exception classes would defeat the lazy import), so the
+    public exception class names / ``code`` attribute are matched instead.  Both
+    are part of the SDK's ``scene.registration.errors`` contract.
+    """
+    names = {cls.__name__ for cls in type(exc).__mro__}
+    code = str(getattr(exc, "code", ""))
+    if "AppAccessDeniedError" in names or code == "access_denied":
+        return "用户拒绝授权，请重新发起"
+    if "AppExpiredError" in names or code == "expired_token":
+        return "二维码已过期，请重新登录"
+    return f"飞书扫码登录失败: {exc}"
+
+
+class FeishuLoginAdapter:
+    """Wrap ``lark_oapi.register_app`` (a blocking scan-to-create flow).
+
+    ``register_app`` blocks until the user scans and the opened app is created;
+    the adapter runs it on a daemon thread and hands the scanned QR URL back to
+    ``start`` through a :class:`threading.Event`, so the event loop never blocks
+    on the SDK.
+    """
+
+    def __init__(
+        self,
+        *,
+        register: Callable[..., dict[str, Any]] | None = None,
+        source: str | None = None,
+        qr_wait_s: float = 60.0,
+    ) -> None:
+        self._register = register
+        # ``source`` is the creation-page tracking tag (``source=python-sdk/<x>``).
+        # Unknown tags may be denied by Feishu "platform policy", so the default
+        # mirrors the source Octop registers with; override with
+        # ``IMGW_FEISHU_REGISTER_SOURCE`` when testing.
+        self._source = source or os.environ.get("IMGW_FEISHU_REGISTER_SOURCE", "").strip() or "octop"
+        self._qr_wait_s = max(0.01, float(qr_wait_s))
+        self._cancel_event = threading.Event()
+        self._qr_ready = threading.Event()
+        self._done = threading.Event()
+        self._qr_payload: dict[str, Any] = {}
+        self._result: dict[str, Any] | None = None
+        self._error: BaseException | None = None
+        self._error_message = ""
+        self._thread: threading.Thread | None = None
+
+    async def start(self) -> LoginChallenge:
+        if self._thread is not None:
+            raise RuntimeError("飞书扫码登录已在进行中，请先取消")
+        if self._register is None:
+            # Cold ``import lark_oapi`` is slow (tens of seconds); warm it before
+            # the QR wait starts so the first scan does not spuriously time out.
+            try:
+                await asyncio.to_thread(_feishu_warm_import)
+            except Exception as exc:
+                raise RuntimeError(f"飞书 SDK 初始化失败: {exc}") from exc
+        self._thread = threading.Thread(
+            target=self._run_register,
+            name="imgw-feishu-login",
+            daemon=True,
+        )
+        self._thread.start()
+
+        deadline = time.monotonic() + self._qr_wait_s
+        while not self._qr_ready.is_set():
+            if self._done.is_set():
+                message = self._error_message or "飞书扫码登录线程提前结束"
+                raise RuntimeError(message)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            await asyncio.sleep(min(0.05, remaining))
+        if not self._qr_ready.is_set():
+            raise RuntimeError(f"等待飞书二维码超时（{self._qr_wait_s:g}s），请重新发起")
+
+        url = str(self._qr_payload.get("url") or "")
+        if not url:
+            raise RuntimeError("飞书扫码登录未返回二维码地址")
+        return LoginChallenge(qr_content=url)
+
+    def _run_register(self) -> None:
+        register = self._register or _feishu_default_register
+        try:
+            result = register(
+                on_qr_code=self._on_qr_code,
+                source=self._source,
+                addons=FEISHU_LOGIN_ADDONS,
+                create_only=True,
+                app_preset=dict(_FEISHU_APP_PRESET),
+                cancel_event=self._cancel_event,
+            )
+        except BaseException as exc:  # recorded and surfaced via poll()
+            self._error = exc
+            self._error_message = _feishu_failure_message(exc)
+        else:
+            self._result = result
+        finally:
+            self._done.set()
+
+    def _on_qr_code(self, info: dict[str, Any]) -> None:
+        self._qr_payload = dict(info) if isinstance(info, dict) else {}
+        self._qr_ready.set()
+
+    async def poll(self) -> LoginPoll:
+        if self._error is not None:
+            return LoginPoll("expired", message=self._error_message or "飞书扫码登录失败")
+        result = self._result
+        if result is not None:
+            client_id = str(result.get("client_id") or "")
+            client_secret = str(result.get("client_secret") or "")
+            if not client_id or not client_secret:
+                return LoginPoll("expired", message="飞书扫码登录成功但未返回应用凭证")
+            return LoginPoll(
+                "success",
+                config_updates={"app_id": client_id, "app_secret": client_secret},
+            )
+        if self._done.is_set():
+            return LoginPoll("expired", message="飞书扫码登录已结束")
+        return LoginPoll("pending")
+
+    async def cancel(self) -> None:
+        self._cancel_event.set()
+        thread = self._thread
+        if thread is not None:
+            await asyncio.to_thread(thread.join, 5.0)
+
+
+# ---------------------------------------------------------------------------
+# WeCom adapter (work.weixin.qq.com scan-to-create bot)
+# ---------------------------------------------------------------------------
+
+_WECOM_GENERATE_URL = "https://work.weixin.qq.com/ai/qc/generate"
+_WECOM_QUERY_URL = "https://work.weixin.qq.com/ai/qc/query_result"
+
+
+def _wecom_plat_code() -> int:
+    """Platform code understood by the WeCom QR endpoint."""
+    platform = sys.platform
+    if platform.startswith("win"):
+        return 2
+    if platform == "darwin":
+        return 1
+    if platform.startswith("linux"):
+        return 3
+    return 0
+
+
+async def _wecom_default_generate(source: str) -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(
+            _WECOM_GENERATE_URL,
+            params={"source": source, "plat": _wecom_plat_code()},
+        )
+        response.raise_for_status()
+        payload = response.json()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        raise RuntimeError("企业微信扫码接口未返回 data")
+    if not data.get("scode") or not data.get("auth_url"):
+        raise RuntimeError("企业微信扫码接口未返回 scode / auth_url")
+    return data
+
+
+async def _wecom_default_query(scode: str) -> dict[str, Any]:
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        response = await client.get(_WECOM_QUERY_URL, params={"scode": scode})
+        response.raise_for_status()
+        payload = response.json()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        return {"status": ""}
+    status = str(data.get("status") or "")
+    if status != "success":
+        return {"status": status}
+    bot_info = data.get("bot_info")
+    bot_info = bot_info if isinstance(bot_info, dict) else {}
+    return {
+        "status": "success",
+        "bot_id": str(bot_info.get("botid") or ""),
+        "secret": str(bot_info.get("secret") or ""),
+    }
+
+
+class WeComLoginAdapter:
+    """Scan a WeCom QR code and return the created bot's credentials."""
+
+    def __init__(
+        self,
+        *,
+        generate: Callable[[str], Awaitable[dict[str, Any]]] | None = None,
+        poll: Callable[[str], Awaitable[dict[str, Any]]] | None = None,
+        source: str = "imgw",
+    ) -> None:
+        self._generate = generate
+        self._poll_fn = poll
+        self._source = source
+        self._scode = ""
+
+    async def start(self) -> LoginChallenge:
+        generate = self._generate or _wecom_default_generate
+        data = await generate(self._source)
+        scode = str(data.get("scode") or "")
+        auth_url = str(data.get("auth_url") or "")
+        if not scode or not auth_url:
+            raise RuntimeError("企业微信扫码接口未返回 scode / auth_url")
+        self._scode = scode
+        return LoginChallenge(qr_content=auth_url)
+
+    async def poll(self) -> LoginPoll:
+        if not self._scode:
+            return LoginPoll("expired", message="登录尚未初始化")
+        poll_fn = self._poll_fn or _wecom_default_query
+        try:
+            result = await poll_fn(self._scode)
+        except Exception as exc:  # network/API failure -> expired with reason
+            logger.exception("wecom QR login failed")
+            return LoginPoll("expired", message=f"企业微信扫码登录失败: {exc}")
+        status = str(result.get("status") or "")
+        if status == "success":
+            bot_id = str(result.get("bot_id") or "")
+            secret = str(result.get("secret") or "")
+            if not bot_id or not secret:
+                return LoginPoll("expired", message="企业微信扫码成功但未返回机器人凭证")
+            return LoginPoll("success", config_updates={"bot_id": bot_id, "secret": secret})
+        if status in {"expired", "timeout"}:
+            return LoginPoll("expired", message="二维码已过期，请重新登录")
+        return LoginPoll("pending")
+
+    async def cancel(self) -> None:
+        self._scode = ""
+
+
+# ---------------------------------------------------------------------------
+# DingTalk adapter (oapi.dingtalk.com device-registration flow)
+# ---------------------------------------------------------------------------
+
+_DINGTALK_BASE_URL = "https://oapi.dingtalk.com"
+
+
+async def _dingtalk_default_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
+    async with httpx.AsyncClient(base_url=_DINGTALK_BASE_URL, timeout=15.0) as client:
+        response = await client.post(path, json=payload)
+        response.raise_for_status()
+        data = response.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("钉钉扫码接口返回格式异常")
+    if data.get("errcode") not in {0, "0", None}:
+        raise RuntimeError(f"钉钉扫码接口错误: {data.get('errmsg') or data.get('errcode')}")
+    return data
+
+
+def _positive_float(value: Any) -> float:
+    """Best-effort ``expires_in`` parsing (missing/garbage -> no timeout)."""
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return parsed if parsed > 0 else 0.0
+
+
+class DingTalkLoginAdapter:
+    """Scan a DingTalk QR code and return the created app's credentials."""
+
+    def __init__(
+        self,
+        *,
+        post: Callable[[str, dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._post = post
+        self._clock = clock
+        self._device_code = ""
+        self._expires_at: float | None = None
+
+    async def start(self) -> LoginChallenge:
+        post = self._post or _dingtalk_default_post
+        init = await post("/app/registration/init", {})
+        nonce = str(init.get("nonce") or "")
+        if not nonce:
+            raise RuntimeError("钉钉扫码初始化未返回 nonce")
+        begin = await post("/app/registration/begin", {"nonce": nonce})
+        device_code = str(begin.get("device_code") or "")
+        qr_url = str(begin.get("verification_uri_complete") or "")
+        if not device_code or not qr_url:
+            raise RuntimeError("钉钉扫码初始化未返回 device_code / verification_uri_complete")
+        self._device_code = device_code
+        expires_in = _positive_float(begin.get("expires_in"))
+        self._expires_at = self._clock() + expires_in if expires_in else None
+        return LoginChallenge(qr_content=qr_url)
+
+    async def poll(self) -> LoginPoll:
+        if not self._device_code:
+            return LoginPoll("expired", message="登录尚未初始化")
+        if self._expires_at is not None and self._clock() >= self._expires_at:
+            self._clear()
+            return LoginPoll("expired", message="二维码已过期，请重新登录")
+        post = self._post or _dingtalk_default_post
+        try:
+            data = await post("/app/registration/poll", {"device_code": self._device_code})
+        except Exception as exc:  # network/API failure -> expired with reason
+            logger.exception("dingtalk QR login failed")
+            self._clear()
+            return LoginPoll("expired", message=f"钉钉扫码登录失败: {exc}")
+        status = str(data.get("status") or "").upper()
+        if status == "WAITING":
+            return LoginPoll("pending")
+        if status == "SUCCESS":
+            self._clear()
+            client_id = str(data.get("client_id") or "")
+            client_secret = str(data.get("client_secret") or "")
+            if not client_id or not client_secret:
+                return LoginPoll("expired", message="钉钉扫码登录成功但未返回应用凭证")
+            return LoginPoll(
+                "success",
+                config_updates={"app_key": client_id, "app_secret": client_secret},
+            )
+        self._clear()
+        if status == "FAIL":
+            reason = str(data.get("fail_reason") or data.get("fail_msg") or "")
+            return LoginPoll("expired", message=f"钉钉扫码登录失败: {reason or '用户未授权'}")
+        return LoginPoll("expired", message="二维码已过期，请重新登录")
+
+    async def cancel(self) -> None:
+        self._clear()
+
+    def _clear(self) -> None:
+        self._device_code = ""
+        self._expires_at = None
+
+
 def default_adapter_factory(kind: str) -> LoginAdapter:
     """Build the default adapter for a channel kind."""
     if kind == "qq":
         return QQLoginAdapter()
     if kind == "weixin":
         return WeixinLoginAdapter()
+    if kind == "feishu":
+        return FeishuLoginAdapter()
+    if kind == "wecom":
+        return WeComLoginAdapter()
+    if kind == "dingtalk":
+        return DingTalkLoginAdapter()
     raise ValueError(f"通道类型不支持扫码登录: {kind!r}")
 
 
@@ -291,9 +680,9 @@ class LoginManager:
 
         result = await session.adapter.poll()
         if result.status == "success":
-            await self._apply_credentials(record, result.config_updates)
+            warning = await self._apply_credentials(record, result.config_updates)
             await self._drop(session, cancel=False)
-            return self._view(session, "confirmed", result.message)
+            return self._view(session, "confirmed", warning or result.message)
         if result.status == "expired":
             await self._drop(session, cancel=False)
             return self._view(session, "expired", result.message)
@@ -335,8 +724,14 @@ class LoginManager:
             with contextlib.suppress(Exception):
                 await session.adapter.cancel()
 
-    async def _apply_credentials(self, record: ChannelRecord, updates: dict[str, Any]) -> None:
-        """Merge confirmed credentials into the channel config and re-register."""
+    async def _apply_credentials(self, record: ChannelRecord, updates: dict[str, Any]) -> str:
+        """Merge confirmed credentials into the config, then try to enable.
+
+        Credentials are persisted **first** (``enabled=False``): a transient
+        start failure (a freshly scanned Feishu app can be blocked by platform
+        policy until published) must not throw away what the user just scanned.
+        Returns a user-facing warning when the channel could not be started.
+        """
         config = dict(record.config)
         accounts = updates.get("accounts")
         if isinstance(accounts, list):
@@ -344,12 +739,22 @@ class LoginManager:
         for key, value in updates.items():
             if key != "accounts":
                 config[key] = value
-        await self._runtime.update_channel(record.channel_id, {"config": config})
+        await self._runtime.persist_login_credentials(record.channel_id, config)
+
+        warning = ""
+        try:
+            await self._runtime.update_channel(record.channel_id, {"enabled": True})
+        except Exception as exc:  # upstream/platform failures are data, not bugs
+            logger.warning("login credentials saved but channel start failed: %s", exc)
+            warning = (
+                f"凭据已保存，但通道启动失败：{exc}。"
+                f"修复后在后台执行 `imgw channel login {record.channel_id}` 重连。"
+            )
         self._runtime.store.add_audit(
             "channel.login",
             actor=self._actor,
             channel_id=record.channel_id,
-            payload={"kind": record.kind, "status": "confirmed"},
+            payload={"kind": record.kind, "status": "confirmed", "started": not warning},
         )
         self._runtime.events.publish(
             {
@@ -357,9 +762,11 @@ class LoginManager:
                 "channel_id": record.channel_id,
                 "kind": record.kind,
                 "status": "confirmed",
+                "started": not warning,
                 "ts": self._clock(),
             }
         )
+        return warning
 
     @staticmethod
     def _merge_accounts(existing: Any, incoming: list[Any]) -> list[Any]:

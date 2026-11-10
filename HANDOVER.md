@@ -827,9 +827,9 @@ CLI ──HTTP──▶ daemon：校验 → 事务写 SQLite → 应用到 manag
 | `GET /readyz` | HTTP + SQLite + enabled 通道已注册（**不含 connected**，§11.2 #5） | — |
 | `GET /v1/status` | 版本、uptime、每通道状态与 capability、队列深度（best-effort）、配置修订号 | — |
 | `GET/POST /v1/channels` | 列表 / 新增（先 probe 后 register，事务写 DB） | DB + manager |
-| `GET/PATCH/DELETE /v1/channels/{ref}` | 详情 / 改 alias·name·enabled·config / 删除 | DB + manager |
+| `GET/PATCH/DELETE /v1/channels/{ref}` | 详情（含**脱敏** config + credentials 摘要）/ 改 alias·name·enabled·config（`"***"` 表示保留原值，部分更新）/ 删除（**要求已 logout**，否则 409） | DB + manager |
 | `POST /v1/channels/probe` | 凭证探测，不注册 | `manager.probe_channel` |
-| `POST /v1/channels/{ref}/login` | 扫码登录（返回 qr 文本/URL），确认后写 DB 并注册 | QR 助手 + DB |
+| `POST /v1/channels/{ref}/login` | 扫码登录（飞书/企微/钉钉/QQ/微信；返回 qr 文本/URL），确认后写 DB + 自动启用并注册 | QR 助手 + DB |
 | `GET /v1/channels/{ref}/subjects` | 已知推送目标（DB 与内存合并） | — |
 | `POST /v1/messages` | 主动推送（`Idempotency-Key` 必填） | `manager.push_*` + audit |
 | `POST /v1/messages/broadcast` | 向某通道全部 subject 推送 | `manager.push_to_all` |
@@ -843,18 +843,17 @@ CLI ──HTTP──▶ daemon：校验 → 事务写 SQLite → 应用到 manag
 
 | 命令 | 作用 | 调控制面 | 触碰状态 / 上游 |
 |---|---|---|---|
-| `imgw run` | **唯一启动进程**：迁移 → 读 DB → reconcile channels → 起 uvicorn | 无（进程本身） | 全量 |
+| `imgw run` | **唯一生产启动进程**：迁移 → 读 DB → reconcile channels → 起 uvicorn | 无（进程本身） | 全量 |
+| `imgw run-dev [--dev-backend-port 9900]` | 开发模式：同进程拉起回显后端，所有 tenant 走它（**不写 backends 行**），其余机制（messages/subjects/dedup/audit）照旧 | 无（进程本身） | 全量 |
 | `imgw install-service [--dry-run] [--print-only] [--user/--system] [--workdir]` | 生成并安装 systemd / launchd / NSSM 定义（`--print-only` 只打印，`--dry-run` 不写不执行） | 无 | 服务定义文件 + 系统命令 |
 | `imgw uninstall-service` / `start [--wait]` / `stop` / `restart` | 生命周期转发给系统服务管理器；`start --wait` 轮询 `/readyz` | `GET /readyz`（仅 `--wait`） | 系统服务 |
 | `imgw start [--wait]` / `stop` / `restart` | 转发给系统服务管理器；`--wait` 轮询 `/readyz` | `GET /readyz` | 系统服务 |
 | `imgw status [--json]` | 守护进程 + 每通道状态 | `GET /v1/status` | 内存 + DB |
-| `imgw channel ls` | 列通道（id/alias/kind/tenant/enabled/created_at） | `GET /v1/channels` | DB |
-| `imgw channel add <kind> --id … [--alias --name --tenant --config k=v …] [--check]` | 新增实例；`--check` 先 probe | `POST /v1/channels` | DB + `manager.add_channel` |
-| `imgw channel show <ref>` | 详情（capability + 运行状态） | `GET /v1/channels/{ref}` | DB + manager |
-| `imgw channel rm <ref> [--purge]` | 停并删；`--purge` 级联 subjects/messages | `DELETE /v1/channels/{ref}` | DB + `manager.remove_channel` |
-| `imgw channel enable/disable <ref>` | 启停，保留配置与数据 | `PATCH /v1/channels/{ref}` | DB + manager |
-| `imgw channel test <ref|kind> --config …` | 凭证探测 | `POST /v1/channels/probe` | `manager.probe_channel` |
-| `imgw channel login <ref>` | 扫码登录，终端渲染二维码 | `POST /v1/channels/{ref}/login` + 轮询 | QR 助手 + DB |
+| `imgw channel login <target> [--id --name --tenant --config --app-id/--app-secret/--bot-id/--secret/--app-key/--token/--account-id/--base-url --secret-stdin --rescan --check --format --json --qr-png --timeout --interval --no-wait --session-id]` | 绑定/重登：kind 建号、无凭据扫码、有凭据重连、凭据参数静默/覆盖、`--rescan` 强制扫码；`--format both|url|qr|json` 控制输出（stdout 数据、stderr 提示） | `GET /v1/channels/{ref}` → `POST /v1/channels` / `PATCH /v1/channels/{ref}` → `POST /v1/channels/{ref}/login` + 轮询 | DB + manager + QR 助手 |
+| `imgw channel logout <ref>` | 停用（=旧 disable），保留凭据、subjects/messages；幂等 | `PATCH /v1/channels/{ref}` `{"enabled": false}` | DB + manager |
+| `imgw channel list [<ref>] [--json] [--header]` | 无参：TSV 列表（channel_id/kind/state/creds/alias）；带 ref：详情（含脱敏 config）；secret 永不输出 | `GET /v1/channels` / `GET /v1/channels/{ref}` | DB + manager |
+| `imgw channel delete <ref> [--purge] [--yes]` | 删行；**要求先 logout**（否则 409）；`--purge` 级联 subjects/messages | `DELETE /v1/channels/{ref}` | DB + `manager.remove_channel` |
+| `imgw channel test <kind> --config …` | 凭证探测 | `POST /v1/channels/probe` | `manager.probe_channel` |
 | `imgw subject ls <ref>` | 已知推送目标 | `GET /v1/channels/{ref}/subjects` | DB + 内存 |
 | `imgw send <ref> <subject> <text>` / `--all` | 主动推送 / 广播 | `POST /v1/messages[/broadcast]` | `manager.push_*` + audit |
 | `imgw events [--channel …]` | tail 事件流（SSE） | `GET /v1/events` | 只读 |
@@ -901,6 +900,15 @@ CLI ──HTTP──▶ daemon：校验 → 事务写 SQLite → 应用到 manag
 - 分批删（`LIMIT 5000` 循环），避免长事务锁库；`auto_vacuum=INCREMENTAL` + 定期 `incremental_vacuum`。
 - 媒体 GC 只看 media_dir 的 mtime/引用，不依赖聊天记录。
 - 隐私：`messages` 含用户原文，DB 0600；`imgw history` 走 token，并审计「谁查了历史」。
+
+### 13.10 开发模式：dev-backend（调试套件）
+
+- 源码套件：`src/im_gateway/dev/backend.py`，暴露 `create_dev_backend_app(token="")` 与 `python -m im_gateway.dev.backend --port 9900`。
+- 契约：`POST /v1/turns` 接收 `kind=start` 帧，SSE 返回 **一帧 `message` + 一帧 `completed`**；`message` 用固定文本一次性返回 `channel_id / channel_kind / tenant_id / subject_id / subject_name / chat_type / session_key / turn_id / idempotency_key / message`，方便通道开发者对照“网关实际收到了什么”。
+- 两种用法：
+  1. `imgw run-dev [--dev-backend-port 9900]`：进程内起 uvicorn 线程，`BackendRouter(override=...)` 让**所有 tenant** 都路由到它，不写 `backends` 表；控制面退出时一起停；
+  2. 独立跑：`uv run python -m im_gateway.dev.backend`，按普通 backend 注册（可带 `--token`）。
+- 仅用于调试：不写 backends 配置、不做真实业务；独立子命令 `run-dev` 即显式开关，生产入口仍是 `run`。
 
 ---
 
@@ -966,7 +974,7 @@ CLI ──HTTP──▶ daemon：校验 → 事务写 SQLite → 应用到 manag
 | `core/` | `contracts.py`（`TurnFrame` 11 种帧 + 逐帧校验 + 上游互转 + metadata JSON 清洗）、`config.py`（`ConfigDocument`）、`capabilities.py`（10 通道初始 capability 表）、`paths.py`（bootstrap 三项 + 0600 token） |
 | `db/` | 9 张表（§13.2）+ `Store`（短连接/线程安全、迁移、分批 prune、`VACUUM INTO` 备份、幂等 claim） |
 | `gateway/` | `app.py`（§13.6 全部路由 + 鉴权 + 错误映射 + SSE）、`runtime.py`（Store↔ChannelManager 接线、状态机、config import、优雅停机）、`factory.py`（per-kind config，weixin 特判）、`events.py`（进程内 SSE 总线）、`processor.py`（**模型 A 实现**）、`idempotency.py`（8 通道 msg id 提取 + hash 兜底）、`maintenance.py`（retention 调度）、`login.py`（扫码登录状态机 + QQ/微信 adapter）、`dev_processor.py`（echo 占位，仅测试/自检用） |
-| `cli/` | 16 个命令（新增 `channel login`），httpx 客户端（UDS/TCP、token、SSE）、segno 二维码；`service.py`（systemd/launchd/NSSM 生成 + 生命周期命令） |
+| `cli/` | 17 个命令（新增 `channel login`、`run-dev`），httpx 客户端（UDS/TCP、token、SSE）、segno 二维码；`service.py`（systemd/launchd/NSSM 生成 + 生命周期命令） |
 | 文档 | `README.md`、本文件 §12~§15 |
 
 ### 15.2 已接通的关键行为（都有单测钉住）
@@ -976,12 +984,12 @@ CLI ──HTTP──▶ daemon：校验 → 事务写 SQLite → 应用到 manag
 3. **落库**：入站一条 + 出站最终内容一条（DELTA 合并，不落 token 碎片）；`subjects` 每条入站刷新；`inbound_dedup` 拦截平台重投；`audit` 记录管理动作。
 4. **优雅停机**：`settings.shutdown_grace_ms`（默认 10s）内等待 `active_turns` 归零，再 `manager.stop()`。
 5. **retention**：启动补跑 + 每日循环；`settings.retention` 覆盖默认；单次失败不杀循环。
-6. **扫码登录**：内存会话状态机（pending/scanned/confirmed/expired/取消，TTL）+ QQ/微信 adapter（可注入 fake；真实 adapter 懒加载上游类）+ 凭证合并写回 channel config（weixin accounts 按 `account_id` 合并）+ 审计 + 事件发布。
+6. **扫码/静默登录**：内存会话状态机（pending/scanned/confirmed/expired/取消，TTL）+ 5 平台 adapter（飞书 `lark_oapi.register_app`、企微 `ai/qc`、钉钉 device flow、QQ/微信上游 helper；均可注入 fake）+ 凭证合并写回 channel config（`"***"` 表示保留原值；weixin accounts 按 `account_id` 合并）+ **登录成功自动启用** + 审计 + 事件发布；CLI `login` 另有静默凭据、重连、`--rescan`、`--format url|qr|json|both`、`--qr-png`、`--no-wait/--session-id`。
 7. **系统服务**：生成 systemd unit / launchd plist / NSSM 命令；`install-service`（默认用户级，`--system` 需 root；`--print-only` 只打印；`--dry-run` 不写不执行）、`uninstall-service`、`start --wait`（轮询 `/readyz`）、`stop`、`restart`；runner 可注入，失败统一 `ServiceError` → exit 1。
 
 ### 15.3 未完成（依赖真实平台/外部环境，需要真机验证）
 
-1. QQ / 微信扫码的真实上游网络调用与真实凭证落地（adapter 与状态机已测，真实平台流程未跑）。
+1. 5 个平台扫码登录的真实上游网络调用（飞书/企微/钉钉/QQ/微信 adapter 与状态机已测，真实平台流程未跑；`lark_oapi.register_app` 的 addons 事件预置效果待真机确认）。
 2. 10 个通道的真实连接与收发（需要真实凭证与网络）。
 3. capability 表逐通道真机校准（§12.7 的初始值未经实测）。
 4. outbox / 推送重试与 delivery 状态（需要真实通道的失败语义验证）。
@@ -992,10 +1000,12 @@ CLI ──HTTP──▶ daemon：校验 → 事务写 SQLite → 应用到 manag
 ### 15.4 测试与覆盖率
 
 ```
-uv run pytest -q                        436 passed
+uv run pytest -q                        451 passed
 uv run ruff check src tests             All checks passed
 uv run mypy                             Success: no issues found (25 source files, strict)
-uv run pytest --cov=im_gateway           TOTAL 2984 stmts, 10 miss, 99%+
+uv run pytest --cov=im_gateway           TOTAL 3400 stmts, 125 miss, 96%
+# 未覆盖分支主要是 feishu/wecom/dingtalk 三个扫码 adapter 的真实 HTTP/线程调用；
+# 离线单测覆盖了全部状态机与错误映射，平台网络分支由真机冒烟验证。
 ```
 
 100% 覆盖的模块：`core/config`、`core/project paths`、`db/models`、`db/schema`、`gateway/app`、`gateway/runtime`、`gateway/events`、`gateway/factory`、`gateway/idempotency`、`cli/client`、`cli/main`、`cli/qr`。
@@ -1012,7 +1022,7 @@ uv run pytest --cov=im_gateway           TOTAL 2984 stmts, 10 miss, 99%+
 5. `POST /v1/channels` 返回 200（不是 201）。
 6. `install-service` 会执行 `systemctl enable --now`（即顺带启动服务），不再只是写文件；`--print-only` 才是纯生成。
 7. `start/stop/restart/uninstall-service` 默认用户级（`--user`），`--system` 需要 root。
-8. `imgw channel login` 的二维码由 CLI 渲染（`qr_content`）或打印图片 URL（`qr_image_url`），网关只返回挑战内容。
+8. `imgw channel login` 的二维码：`--format both|url|qr|json` 控制 stdout（`url` 只有一行 URL，`json` 为 NDJSON event），终端二维码由 CLI 用 `segno` 渲染，`--qr-png PATH` 另写 PNG（GUI/手机扫码用）；网关只返回挑战内容。
 
 ### 15.6 下一步（需要真实环境）
 

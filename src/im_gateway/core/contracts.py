@@ -19,7 +19,7 @@ from __future__ import annotations
 import time
 from collections.abc import Mapping
 from enum import StrEnum
-from typing import TYPE_CHECKING, Annotated, Any, Literal, cast
+from typing import TYPE_CHECKING, Annotated, Any, Final, Literal, cast
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -355,6 +355,21 @@ def jsonable_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
     return result
 
 
+#: Channel kinds whose transport only carries 1:1 chats.  Upstream leaves
+#: ``ChannelSubject.chat_type`` empty for these (e.g. the WeChat iLink bot), so the
+#: wire contract fills in the semantic default instead of sending an empty field.
+_DIRECT_ONLY_KINDS: Final[frozenset[str]] = frozenset({"weixin"})
+
+
+def _subject_chat_type(channel_type: str | None, chat_type: str | None) -> str:
+    normalized = (chat_type or "").strip()
+    if normalized:
+        return normalized
+    if (channel_type or "") in _DIRECT_ONLY_KINDS:
+        return "direct"
+    return ""
+
+
 def start_from_inbound(
     message: InboundMessage,
     *,
@@ -387,7 +402,7 @@ def start_from_inbound(
         ),
         subject=SubjectRef(
             subject_id=subject.subject_id,
-            chat_type=subject.chat_type or "",
+            chat_type=_subject_chat_type(message.channel_type, subject.chat_type),
             display_name=subject.display_name or "",
         ),
         session_key=session_key,
