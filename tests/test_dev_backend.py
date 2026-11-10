@@ -1,9 +1,8 @@
-"""Tests for the developer echo backend kit (``imgw run --dev-backend``)."""
+"""Tests for the developer echo backend kit (``imgw run-dev``)."""
 
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any
 
 from fastapi.testclient import TestClient
@@ -16,9 +15,8 @@ from im_gateway.core.contracts import (
     TextContent,
     TurnFrame,
 )
-from im_gateway.db.store import Store
 from im_gateway.dev.backend import create_dev_backend_app, summary_text
-from im_gateway.gateway.processor import BackendRouter, BackendSpec
+from im_gateway.gateway.processor import resolve_backend_spec
 
 
 def start_frame() -> TurnFrame:
@@ -103,16 +101,7 @@ def test_summary_text_contains_everything() -> None:
         assert needle in text
 
 
-def test_backend_router_dev_override(db_path: Path) -> None:
-    store = Store(db_path)
-    store.migrate()
-    spec = BackendSpec(
-        tenant_id="",
-        base_url="http://127.0.0.1:9900",
-        token="",
-        timeout_ms=1000,
-        enabled=True,
-    )
-    router = BackendRouter(store, override=spec)
-    assert router.resolve("acme") is spec
-    assert router.resolve(None) is spec
+def test_resolve_backend_spec_points_at_dev_backend() -> None:
+    """``imgw run-dev`` just overrides the global URL to the echo backend."""
+    spec = resolve_backend_spec(backend_url="http://127.0.0.1:9900/", env={})
+    assert spec.base_url == "http://127.0.0.1:9900"

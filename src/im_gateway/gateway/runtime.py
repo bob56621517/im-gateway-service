@@ -29,15 +29,14 @@ from typing import TYPE_CHECKING, Any, Final
 from im_gateway.core import paths
 from im_gateway.core.config import (
     MASKED_SECRET,
-    BackendConfigEntry,
     ChannelConfigEntry,
     ConfigDocument,
 )
-from im_gateway.db.models import BackendRecord, ChannelRecord, MessageRecord
+from im_gateway.db.models import ChannelRecord, MessageRecord
 from im_gateway.db.store import Store
 from im_gateway.gateway.events import EventBus
 from im_gateway.gateway.factory import build_config, constraints_of
-from im_gateway.gateway.processor import BackendSpec, build_processor
+from im_gateway.gateway.processor import BackendSpec, build_processor, resolve_backend_spec
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from octop_gateway.channel import MessageProcessor
@@ -58,7 +57,7 @@ _DEFAULT_SHUTDOWN_GRACE_MS: Final[int] = 10_000
 _ACTOR: Final[str] = "api-token"
 #: Fields accepted by :meth:`GatewayRuntime.update_channel`.
 _CHANNEL_UPDATE_FIELDS: Final[frozenset[str]] = frozenset(
-    {"kind", "tenant_id", "alias", "name", "enabled", "config", "constraints"}
+    {"kind", "alias", "name", "enabled", "config", "constraints"}
 )
 #: Marker for "a masked value has no old value to fall back to".
 _MISSING: Final[object] = object()
@@ -113,7 +112,6 @@ def _entry_for(record: ChannelRecord) -> ChannelConfigEntry:
     return ChannelConfigEntry(
         channel_id=record.channel_id,
         kind=record.kind,
-        tenant_id=record.tenant_id,
         alias=record.alias,
         name=record.name,
         enabled=record.enabled,
@@ -124,7 +122,7 @@ def _entry_for(record: ChannelRecord) -> ChannelConfigEntry:
 
 def _is_structural_change(record: ChannelRecord, fields: dict[str, Any]) -> bool:
     """True when a PATCH needs a manager remove+add (HANDOVER §13.4)."""
-    for name in ("kind", "tenant_id", "config", "constraints"):
+    for name in ("kind", "config", "constraints"):
         if name in fields and fields[name] != getattr(record, name):
             return True
     return "enabled" in fields and bool(fields["enabled"]) != record.enabled
@@ -168,12 +166,12 @@ class GatewayRuntime:
         manager: Any | None = None,
         processor: MessageProcessor | None = None,
         media_dir: Path | None = None,
-        dev_backend: BackendSpec | None = None,
+        backend: BackendSpec | None = None,
     ) -> None:
         self.store = store
         self.token = token
-        #: Dev mode: route every turn to this backend (``imgw run --dev-backend``).
-        self._dev_backend = dev_backend
+        #: The single backend every turn is posted to (read-only for ``status``).
+        self._backend = backend if backend is not None else resolve_backend_spec()
         self.media_dir = Path(media_dir) if media_dir is not None else paths.default_media_dir()
         self.events = EventBus()
         #: Warnings from the most recent :meth:`apply_config` call.
@@ -211,6 +209,11 @@ class GatewayRuntime:
         return str(getattr(self.store, "_path", ""))
 
     @property
+    def backend_url(self) -> str:
+        """Effective backend base URL, for ``/v1/status`` (read-only)."""
+        return self._backend.base_url
+
+    @property
     def uptime_s(self) -> float:
         if self._started_at is None:
             return 0.0
@@ -237,8 +240,8 @@ class GatewayRuntime:
             # Reads settings -> must happen after migrate().
             self._processor = build_processor(
                 self.store,
+                backend=self._backend,
                 events=self.events,
-                dev_backend=self._dev_backend,
             )
         if self._manager is None:
             self._manager = self._build_manager()
@@ -354,7 +357,6 @@ class GatewayRuntime:
             channel_type=record.kind,
             config=config,
             channel_id=record.channel_id,
-            tenant_id=record.tenant_id,
             constraints=constraints,
         )
         self._registered.add(record.channel_id)
@@ -411,7 +413,6 @@ class GatewayRuntime:
         record = ChannelRecord(
             channel_id=entry.channel_id,
             kind=entry.kind,
-            tenant_id=entry.tenant_id,
             alias=entry.alias,
             name=entry.name,
             config=dict(entry.config),
@@ -459,9 +460,9 @@ class GatewayRuntime:
     async def update_channel(self, ref: str, fields: dict[str, Any]) -> None:
         """Apply a PATCH.
 
-        ``alias``/``name`` update in place; ``kind``/``tenant_id``/``config``/
-        ``constraints``/``enabled`` go through remove+add because upstream has
-        no update or restart API (HANDOVER §11.2 #9 / §13.4).
+        ``alias``/``name`` update in place; ``kind``/``config``/``constraints``/
+        ``enabled`` go through remove+add because upstream has no update or
+        restart API (HANDOVER §11.2 #9 / §13.4).
         """
         record = self._require_channel(ref)
         unknown = set(fields) - _CHANNEL_UPDATE_FIELDS
@@ -528,7 +529,6 @@ class GatewayRuntime:
                 self.store.update_channel(
                     record.channel_id,
                     kind=record.kind,
-                    tenant_id=record.tenant_id,
                     alias=record.alias,
                     name=record.name,
                     config=record.config,
@@ -568,7 +568,6 @@ class GatewayRuntime:
         await manager.probe_channel(
             entry.kind,
             dict(entry.config),
-            tenant_id=entry.tenant_id,
             channel_id=entry.channel_id,
         )
 
@@ -727,7 +726,6 @@ class GatewayRuntime:
         """
         self.last_config_warnings = []
         existing_channels = {record.channel_id: record for record in self.store.list_channels()}
-        existing_backends = {record.tenant_id: record for record in self.store.list_backends()}
         existing_settings = self.store.get_settings()
         existing_aliases = {
             record.alias: record.channel_id for record in existing_channels.values() if record.alias
@@ -752,20 +750,6 @@ class GatewayRuntime:
                 if owner is not None and owner != channel_entry.channel_id and owner in wanted_ids:
                     raise ValueError(f"alias {channel_entry.alias!r} 已被通道 {owner!r} 占用")
             resolved_channels.append((channel_entry, old_channel, resolved_config))
-
-        resolved_backends: list[tuple[BackendConfigEntry, str, BackendRecord | None]] = []
-        for backend_entry in doc.backends:
-            old_backend = existing_backends.get(backend_entry.tenant_id)
-            token_ref = backend_entry.token_ref
-            if token_ref == MASKED_SECRET:
-                if old_backend is None:
-                    raise ValueError(f"backend {backend_entry.tenant_id!r} 是新增的,不能使用打码的 token_ref")
-                token_ref = old_backend.token_ref
-            if not token_ref.strip():
-                raise ValueError(f"backend {backend_entry.tenant_id!r} 的 token_ref 不能为空")
-            if not backend_entry.base_url.strip():
-                raise ValueError(f"backend {backend_entry.tenant_id!r} 的 base_url 不能为空")
-            resolved_backends.append((backend_entry, token_ref, old_backend))
 
         resolved_settings: dict[str, Any] = {}
         for key, raw_value in doc.settings.items():
@@ -792,7 +776,6 @@ class GatewayRuntime:
                 record = ChannelRecord(
                     channel_id=channel_entry.channel_id,
                     kind=channel_entry.kind,
-                    tenant_id=channel_entry.tenant_id,
                     alias=channel_entry.alias,
                     name=channel_entry.name,
                     config=resolved_config,
@@ -810,7 +793,6 @@ class GatewayRuntime:
 
             changed = (
                 old_channel.kind != channel_entry.kind
-                or old_channel.tenant_id != channel_entry.tenant_id
                 or old_channel.alias != channel_entry.alias
                 or old_channel.name != channel_entry.name
                 or old_channel.config != resolved_config
@@ -826,7 +808,6 @@ class GatewayRuntime:
 
             runtime_relevant = (
                 old_channel.kind != channel_entry.kind
-                or old_channel.tenant_id != channel_entry.tenant_id
                 or old_channel.config != resolved_config
                 or old_channel.constraints != dict(channel_entry.constraints)
                 or old_channel.enabled != channel_entry.enabled
@@ -836,7 +817,6 @@ class GatewayRuntime:
             updated = self.store.update_channel(
                 channel_entry.channel_id,
                 kind=channel_entry.kind,
-                tenant_id=channel_entry.tenant_id,
                 alias=channel_entry.alias,
                 name=channel_entry.name,
                 config=resolved_config,
@@ -849,28 +829,11 @@ class GatewayRuntime:
                 # Alias/name-only edits keep the live instance untouched.
                 await self._start_after_config_change(updated)
 
-        wanted_tenants = {entry.tenant_id for entry, _, _ in resolved_backends}
-        for tenant_id in sorted(set(existing_backends) - wanted_tenants):
-            self.store.delete_backend(tenant_id)
-        for backend_entry, token_ref, old_backend in resolved_backends:
-            self.store.upsert_backend(
-                BackendRecord(
-                    tenant_id=backend_entry.tenant_id,
-                    base_url=backend_entry.base_url,
-                    token_ref=token_ref,
-                    timeout_ms=backend_entry.timeout_ms,
-                    enabled=backend_entry.enabled,
-                    created_at=old_backend.created_at if old_backend is not None else now,
-                    updated_at=now,
-                )
-            )
-
         for key, value in resolved_settings.items():
             self.store.set_setting(key, value)
 
         applied = {
             "channels": len(resolved_channels),
-            "backends": len(resolved_backends),
             "settings": len(resolved_settings),
         }
         self._audit("config.import", None, dict(applied))

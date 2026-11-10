@@ -2,10 +2,11 @@
 
 Two ways to use this kit:
 
-* **in-process** — ``imgw run --dev-backend`` starts this app on a loopback port
-  and routes **every tenant** to it (no ``backends`` row is written);
+* **in-process** — ``imgw run-dev`` starts this app on a loopback port and
+  points the global backend URL at it (no DB row is written; the gateway has no
+  backend table anymore);
 * **standalone** — ``uv run python -m im_gateway.dev.backend --port 9900`` and
-  register it as a normal backend when you want to debug another gateway.
+  point ``--backend-url`` at it when you want to debug another gateway.
 
 It implements the minimum model-A contract (HANDOVER §12): ``POST /v1/turns``
 consumes the ``kind=start`` frame and streams two SSE frames back — one
@@ -39,7 +40,6 @@ def summary_text(start: TurnFrame) -> str:
         "✅ dev-backend received a turn",
         f"channel_id      {channel.channel_id if channel else '-'}",
         f"channel_kind    {channel.kind if channel else '-'}",
-        f"tenant_id       {(channel.tenant_id if channel else None) or '-'}",
         f"subject_id      {subject.subject_id if subject else '-'}",
         f"subject_name    {(subject.display_name if subject else '') or '-'}",
         f"chat_type       {(subject.chat_type if subject else '') or '-'}",
@@ -71,7 +71,7 @@ def create_dev_backend_app(*, token: str = "") -> FastAPI:
     """Build the debug backend ASGI app.
 
     An empty *token* accepts any caller (in-process dev mode); pass the same
-    bearer the gateway uses when you register this app as a normal backend.
+    bearer the gateway uses when you point it at this app.
     """
     app = FastAPI(title="im-gateway dev backend", version="0.1.0")
 

@@ -1,10 +1,18 @@
-"""SQLite schema v1 (HANDOVER §13.2).
+"""SQLite schema (HANDOVER §13.2; v2 in §16).
 
 The DDL text below is the **single authoritative definition** of the on-disk
 schema. ``Store.migrate()`` applies every entry of :data:`MIGRATIONS` whose
 version is not yet recorded in ``schema_migrations``; therefore each migration
 must be idempotent (``IF NOT EXISTS``) and must never edit an already shipped
 entry.
+
+Schema history:
+
+* **v1** — tenant-aware routing: a ``backends`` table (tenant -> webhook) and a
+  ``channels.tenant_id`` column.
+* **v2** — the gateway no longer manages backend routing (GitHub issue #3): drop
+  the ``backends`` table and ``channels.tenant_id``. The backend is one URL from
+  ``--backend-url`` / ``IMGW_BACKEND_URL``.
 
 Operational pragmas (applied by ``Store``, not here):
 
@@ -28,8 +36,8 @@ __all__ = [
     "SCHEMA_VERSION",
 ]
 
-#: Version of the schema described in HANDOVER §13.2.
-SCHEMA_VERSION: Final[int] = 1
+#: Current schema version (v2: single backend URL, no tenant routing).
+SCHEMA_VERSION: Final[int] = 2
 
 #: Version -> DDL. Sorted application order is insertion order of the mapping.
 _SCHEMA_V1: Final[str] = """
@@ -124,6 +132,13 @@ CREATE TABLE IF NOT EXISTS turn_events (
 
 MIGRATIONS: Final[dict[int, str]] = {
     1: _SCHEMA_V1,
+    2: """
+-- v2: the gateway no longer manages backend routing (GitHub issue #3): one
+-- backend URL comes from --backend-url / IMGW_BACKEND_URL. SQLite >= 3.35 is
+-- required for DROP COLUMN; the bundled Python 3.12 satisfies that.
+DROP TABLE IF EXISTS backends;
+ALTER TABLE channels DROP COLUMN tenant_id;
+""",
 }
 
 LATEST_SCHEMA_VERSION: Final[int] = max(MIGRATIONS)

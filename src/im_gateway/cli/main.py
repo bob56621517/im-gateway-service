@@ -28,7 +28,7 @@ import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Annotated, Any, NoReturn, cast
+from typing import Annotated, Any, Final, NoReturn, cast
 from urllib.parse import quote
 
 import httpx
@@ -51,7 +51,7 @@ from im_gateway.core.config import ChannelConfigEntry, ConfigDocument
 
 __all__ = ["app", "main"]
 
-CHANNEL_TABLE_HEADERS = ["CHANNEL_ID", "KIND", "TENANT", "ALIAS", "ENABLED", "STATE", "NAME"]
+CHANNEL_TABLE_HEADERS = ["CHANNEL_ID", "KIND", "ALIAS", "ENABLED", "STATE", "NAME"]
 HISTORY_TABLE_HEADERS = ["TS", "CHANNEL_ID", "SUBJECT_ID", "DIR", "KIND", "TEXT"]
 SUBJECT_TABLE_HEADERS = ["SUBJECT_ID", "CHAT_TYPE", "DISPLAY_NAME", "FIRST_SEEN", "LAST_SEEN"]
 
@@ -92,6 +92,7 @@ app = typer.Typer(
         "\n"
         "\b\n"
         "$ imgw run                                 # terminal 1: start the daemon\n"
+        "$ imgw run --backend-url http://127.0.0.1:8080   # ...with an explicit backend\n"
         "$ imgw status                              # terminal 2: daemon + channel state\n"
         "$ imgw channel login feishu --name sales   # QR-code bind (5 platforms)\n"
         "$ imgw channel list                        # TSV: channel_id kind state creds alias\n"
@@ -110,6 +111,9 @@ app = typer.Typer(
         "IMGW_URL         control-plane URL (http(s)://host:port or unix:///path/to.sock)\n"
         "IMGW_TOKEN       control-plane bearer token\n"
         "IMGW_TOKEN_FILE  file holding the bearer token (created by `imgw run`)\n"
+        "IMGW_BACKEND_URL       agent backend base URL (default http://127.0.0.1:8080)\n"
+        "IMGW_BACKEND_TOKEN     optional bearer token sent to the backend\n"
+        "IMGW_BACKEND_TIMEOUT_MS  backend turn timeout in milliseconds (default 120000)\n"
         "IMGW_LANG        help/error language: en (default) or zh (zh_CN, zh-TW, GBK/936)\n"
         "\n"
         "Exit codes:\n"
@@ -380,7 +384,6 @@ def _channel_row(channel: dict[str, Any]) -> list[str]:
     return [
         str(channel.get("channel_id", "")),
         str(channel.get("kind", "")),
-        str(channel.get("tenant_id") or "-"),
         str(channel.get("alias") or "-"),
         "yes" if channel.get("enabled") else "no",
         str(channel.get("state", "")),
@@ -393,7 +396,6 @@ def _channel_details(channel: dict[str, Any]) -> str:
     lines = [
         f"channel_id      {channel.get('channel_id', '-')}",
         f"kind            {channel.get('kind', '-')}",
-        f"tenant_id       {channel.get('tenant_id') or '-'}",
         f"alias           {channel.get('alias') or '-'}",
         f"name            {channel.get('name') or '-'}",
         f"enabled         {channel.get('enabled')}",
@@ -563,7 +565,7 @@ def version(
 @app.command(
     help=t(
         "Show daemon status: service and octop-gateway versions, uptime, database "
-        "and media paths, backend and channel counters, and per-channel state "
+        "and media paths, the effective backend URL, and per-channel state "
         "(`GET /v1/status`)."
     ),
     epilog=t(
@@ -597,7 +599,7 @@ def status(
         f"uptime          {_fmt_uptime(payload.get('uptime_s'))}",
         f"db              {payload.get('db_path', '-')}",
         f"media           {payload.get('media_dir', '-')}",
-        f"backends        {payload.get('backends', 0)}",
+        f"backend_url     {payload.get('backend_url', '-')}",
     ]
     counts = payload.get("counts")
     if isinstance(counts, dict) and counts:
@@ -915,15 +917,17 @@ def _doctor_detail(name: str, payload: Any) -> str:
         "Start the gateway daemon in the foreground (the production entry point). "
         "This is the only command that starts a process: it migrates and opens the "
         "SQLite database, reconciles enabled channels from the database, and serves "
-        "the control plane plus all channel connections in one asyncio loop. Stop "
-        "it with Ctrl-C; for a managed service use `imgw install-service` followed "
-        "by `imgw start`."
+        "the control plane plus all channel connections in one asyncio loop. Every "
+        "inbound turn is POSTed to one backend URL: `--backend-url`, then "
+        "`$IMGW_BACKEND_URL`, then `http://127.0.0.1:8080`. Stop it with Ctrl-C; "
+        "for a managed service use `imgw install-service` followed by `imgw start`."
     ),
     epilog=t(
         "Examples:\n"
         "\n"
         "\b\n"
         "$ imgw run\n"
+        "$ imgw run --backend-url http://127.0.0.1:8080\n"
         "$ imgw run --host 127.0.0.1 --port 8765\n"
     ),
     short_help=t('Start the gateway daemon (production).'),
@@ -931,10 +935,22 @@ def _doctor_detail(name: str, payload: Any) -> str:
 def run(
     host: Annotated[str, typer.Option("--host", help=t("Control-plane listen host."))] = "127.0.0.1",
     port: Annotated[int, typer.Option("--port", help=t("Control-plane listen port."))] = 8765,
+    backend_url: Annotated[
+        str | None,
+        typer.Option(
+            "--backend-url",
+            envvar="IMGW_BACKEND_URL",
+            help=t(
+                "Agent backend base URL; every turn is POSTed to "
+                "`{url}/v1/turns` (default: $IMGW_BACKEND_URL, then "
+                "http://127.0.0.1:8080)."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Start the gateway daemon in the foreground (the production entry point)."""
     # TODO(milestone-2): also expose --db / --listen once the daemon accepts them.
-    _start_daemon(host=host, port=port)
+    _start_daemon(host=host, port=port, backend_url=backend_url)
 
 
 @app.command(
@@ -942,11 +958,11 @@ def run(
     help=t(
         "Start the daemon in development mode. On top of a normal run, an "
         "in-process echo backend (`im_gateway.dev.backend`) listens on "
-        "`--dev-backend-port` and every tenant is routed to it; the `backends` "
-        "table is not modified. The echo backend replies to any inbound message "
-        "with one `message` frame and one `completed` frame listing channel, "
-        "subject, turn and idempotency ids, so channel connectivity can be "
-        "verified without a real webhook."
+        "`--dev-backend-port`, and the global backend URL is pointed at it (all "
+        "other mechanisms — token, timeout, history, dedup — are unchanged). The "
+        "echo backend replies to any inbound message with one `message` frame and "
+        "one `completed` frame listing channel, subject, turn and idempotency ids, "
+        "so channel connectivity can be verified without a real backend."
     ),
     epilog=t(
         "Examples:\n"
@@ -969,11 +985,11 @@ def run_dev(
         ),
     ] = 9900,
 ) -> None:
-    """Start the daemon in dev mode: every tenant is routed to the echo backend.
+    """Start the daemon in dev mode with the global backend URL on the echo backend.
 
     The echo backend (``im_gateway.dev.backend``) replies to any inbound message
     with a fixed text that lists channel / subject / turn / idempotency / text,
-    so gateway–channel connectivity can be verified without a real webhook.
+    so gateway–channel connectivity can be verified without a real backend.
     """
     _start_daemon(host=host, port=port, dev_backend=True, dev_backend_port=dev_backend_port)
 
@@ -1258,6 +1274,11 @@ def restart(
 
 _LOGIN_FORMATS = ("both", "url", "qr", "json")
 
+#: Default overall login wait (15 minutes).  It is also the QR validity where
+#: the platform honours a wait knob; platforms that decide their own TTL report
+#: it back and the wait is clamped to it.
+DEFAULT_LOGIN_TIMEOUT_S: Final[float] = 900.0
+
 
 def _stderr(text: str) -> None:
     """Progress/notice output; never pollutes a data pipe."""
@@ -1427,6 +1448,59 @@ def _emit_login_challenge(challenge: dict[str, Any], output_format: str) -> None
     _emit_terminal_qr(text)
 
 
+def _login_app_name(kind: str) -> str:
+    """Localized name of the app the user must scan with."""
+    if kind == "weixin":
+        return t("WeChat")
+    if kind == "wecom":
+        return t("WeCom")
+    if kind == "dingtalk":
+        return t("DingTalk")
+    if kind == "feishu":
+        return t("Feishu")
+    if kind == "qq":
+        return t("QQ")
+    return t("this app")
+
+
+def _format_login_ttl(seconds: float) -> str:
+    """Human duration for the QR-validity hint (localized)."""
+    total = round(seconds)
+    if total < 60:
+        return t("1 second") if total == 1 else t("{value} seconds", value=total)
+    minutes, rest = divmod(total, 60)
+    if rest == 0:
+        return t("1 minute") if minutes == 1 else t("{value} minutes", value=minutes)
+    return t("{minutes} minutes {seconds} seconds", minutes=minutes, seconds=rest)
+
+
+def _emit_login_hint(challenge: dict[str, Any], output_format: str) -> None:
+    """One-line scan hint: app, optional platform validity, and the fallback link."""
+    if output_format == "json":
+        return  # keep the NDJSON stream free of prose
+    kind = str(challenge.get("kind") or "")
+    app = _login_app_name(kind)
+    url = _login_qr_text(challenge)
+    ttl = challenge.get("expires_in_s")
+    if isinstance(ttl, int | float) and not isinstance(ttl, bool) and ttl > 0:
+        _stderr(
+            t(
+                "Scan the QR code with {app} (valid for {ttl}), or open this link in {app}: {url}",
+                app=app,
+                ttl=_format_login_ttl(float(ttl)),
+                url=url,
+            )
+        )
+        return
+    _stderr(
+        t(
+            "Scan the QR code with {app}, or open this link in {app}: {url}",
+            app=app,
+            url=url,
+        )
+    )
+
+
 def _qr_login(
     client: httpx.Client,
     ref: str,
@@ -1446,13 +1520,14 @@ def _qr_login(
         if output_format == "json":
             typer.echo(_compact_json({"event": "challenge", **challenge}))
     else:
-        challenge = control_plane.api(client, "POST", path)
+        challenge = control_plane.api(client, "POST", path, json_body={"timeout_s": timeout})
         sid = str(challenge.get("session_id") or "")
         if not sid:
             _fail(t("the daemon did not return a login session_id"))
         if qr_png:
             _write_login_qr_png(challenge, qr_png)
         _emit_login_challenge(challenge, output_format)
+        _emit_login_hint(challenge, output_format)
     sid = str(challenge.get("session_id") or "")
     if not sid:
         _fail(t("the daemon did not return a login session_id"))
@@ -1464,7 +1539,12 @@ def _qr_login(
             )
         )
         return challenge
-    deadline = time.monotonic() + max(0.1, timeout)
+    wait_s = max(0.1, timeout)
+    ttl = challenge.get("expires_in_s")
+    if isinstance(ttl, int | float) and not isinstance(ttl, bool) and ttl > 0:
+        # Platform-decided QR TTL: no point waiting long past it.
+        wait_s = min(wait_s, float(ttl) + 5.0)
+    deadline = time.monotonic() + wait_s
     status = str(challenge.get("status") or "pending")
     result: dict[str, Any] = challenge
     while status in {"pending", "scanned"} and time.monotonic() < deadline:
@@ -1527,7 +1607,6 @@ def _channel_detail_lines(channel: dict[str, Any]) -> list[tuple[str, str]]:
     lines: list[tuple[str, str]] = [
         ("channel_id", str(channel.get("channel_id") or "-")),
         ("kind", str(channel.get("kind") or "-")),
-        ("tenant_id", str(channel.get("tenant_id") or "-")),
         ("alias", str(channel.get("alias") or "-")),
         ("name", str(channel.get("name") or "-")),
         ("enabled", str(bool(channel.get("enabled")))),
@@ -1645,10 +1724,6 @@ def channel_login(
             help=t("Instance name for a new channel (also used as the CLI alias)."),
         ),
     ] = "",
-    tenant: Annotated[
-        str | None,
-        typer.Option("--tenant", help=t("Tenant id (backend routing key) for a new channel.")),
-    ] = None,
     config: Annotated[
         list[str] | None,
         typer.Option(
@@ -1708,8 +1783,15 @@ def channel_login(
     ] = "",
     timeout: Annotated[
         float,
-        typer.Option("--timeout", help=t("Overall wait for login confirmation (seconds).")),
-    ] = 300.0,
+        typer.Option(
+            "--timeout",
+            help=t(
+                "Overall login wait in seconds (default 15 minutes).  Also the QR validity "
+                "where the platform honours it; platforms with their own TTL report it and "
+                "the wait is clamped to that value."
+            ),
+        ),
+    ] = DEFAULT_LOGIN_TIMEOUT_S,
     interval: Annotated[
         float,
         typer.Option("--interval", help=t("Poll interval while waiting for confirmation (seconds).")),
@@ -1772,7 +1854,6 @@ def channel_login(
             entry = ChannelConfigEntry(
                 channel_id=new_id,
                 kind=target,
-                tenant_id=tenant,
                 alias=alias,
                 name=name,
                 enabled=bool(values),
@@ -2269,7 +2350,6 @@ def config_import(
     typer.echo(
         "applied: "
         f"channels={applied.get('channels', 0)} "
-        f"backends={applied.get('backends', 0)} "
         f"settings={applied.get('settings', 0)}"
     )
 
@@ -2307,10 +2387,8 @@ def config_validate(
         raise typer.Exit(1) from None
     typer.echo(
         t(
-            "config OK: {channels} channel(s), {backends} backend(s), "
-            "{settings} setting(s)",
+            "config OK: {channels} channel(s), {settings} setting(s)",
             channels=len(document.channels),
-            backends=len(document.backends),
             settings=len(document.settings),
         )
     )

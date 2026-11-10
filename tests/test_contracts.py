@@ -28,7 +28,7 @@ def make_start(**overrides: object) -> TurnFrame:
     values: dict[str, object] = {
         "turn_id": "01TESTTURN",
         "kind": FrameKind.START,
-        "channel": ChannelRef(channel_id="feishu:acme:sales", kind="feishu", tenant_id="acme"),
+        "channel": ChannelRef(channel_id="feishu:acme:sales", kind="feishu", tenant_id=""),
         "subject": SubjectRef(subject_id="ou_1", chat_type="direct", display_name="张三"),
         "session_key": "ou_1",
         "idempotency_key": "feishu:om_1",
@@ -193,7 +193,9 @@ def test_start_from_inbound_maps_fields() -> None:
         turn_id="01TEST",
     )
     assert frame.kind is FrameKind.START
-    assert frame.channel is not None and frame.channel.tenant_id == "acme"
+    # The frozen ChannelRef.tenant_id field stays on the wire but is always empty:
+    # the gateway no longer routes per tenant.
+    assert frame.channel is not None and frame.channel.tenant_id == ""
     assert frame.subject is not None and frame.subject.chat_type == "group"
     assert frame.metadata["message_id"] == "om_1"
     assert frame.group_context is not None

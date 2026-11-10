@@ -80,7 +80,6 @@ class StubManager:
         channel_type: str,
         config: Any,
         channel_id: str,
-        tenant_id: str | None,
         constraints: ChannelConstraints | None = None,
     ) -> str:
         if channel_type in self.fail_add_kinds:
@@ -90,7 +89,6 @@ class StubManager:
                 "channel_type": channel_type,
                 "config": config,
                 "channel_id": channel_id,
-                "tenant_id": tenant_id,
                 "constraints": constraints,
             }
         )
@@ -106,7 +104,6 @@ class StubManager:
         channel_type: str,
         config: Any,
         *,
-        tenant_id: str | None = None,
         channel_id: str | None = None,
     ) -> None:
         self.probes.append({"channel_type": channel_type, "config": config})
@@ -135,13 +132,11 @@ def make_record(
     alias: str | None = "sales",
     enabled: bool = True,
     config: dict[str, Any] | None = None,
-    tenant_id: str | None = "acme",
 ) -> ChannelRecord:
     now = 1_700_000_000.0
     return ChannelRecord(
         channel_id=channel_id,
         kind=kind,
-        tenant_id=tenant_id,
         alias=alias,
         name="Sales",
         config=config if config is not None else {"app_id": "cli_x"},
@@ -163,7 +158,6 @@ def make_entry(
     return ChannelConfigEntry(
         channel_id=channel_id,
         kind=kind,
-        tenant_id="acme",
         alias=alias,
         name="Sales",
         enabled=enabled,
@@ -173,12 +167,11 @@ def make_entry(
 
 def initial_document() -> dict[str, Any]:
     return {
-        "version": 1,
+        "version": 2,
         "channels": [
             {
                 "channel_id": CHANNEL_ID,
                 "kind": "feishu",
-                "tenant_id": "acme",
                 "alias": "sales",
                 "name": "Sales",
                 "enabled": True,
@@ -188,14 +181,6 @@ def initial_document() -> dict[str, Any]:
                     "nested": {"token": "literal-inner-token"},
                 },
                 "constraints": {},
-            }
-        ],
-        "backends": [
-            {
-                "tenant_id": "acme",
-                "base_url": "http://127.0.0.1:9000",
-                "token_ref": "literal-backend-token",
-                "timeout_ms": 5000,
             }
         ],
         "settings": {"workers_per_channel": 2},
@@ -609,16 +594,15 @@ async def test_list_subjects_survives_memory_registry_failure(db_path: Path) -> 
 async def test_apply_config_masks_delete_and_settings(db_path: Path) -> None:
     async with running_runtime(db_path) as (runtime, manager):
         applied = await runtime.apply_config(ConfigDocument.model_validate(initial_document()))
-        assert applied == {"channels": 1, "backends": 1, "settings": 1}
+        assert applied == {"channels": 1, "settings": 1}
         assert len(manager.added) == 1
 
         masked = {
-            "version": 1,
+            "version": 2,
             "channels": [
                 {
                     "channel_id": CHANNEL_ID,
                     "kind": "feishu",
-                    "tenant_id": "acme",
                     "alias": "sales",
                     "name": "Renamed",
                     "enabled": True,
@@ -630,35 +614,24 @@ async def test_apply_config_masks_delete_and_settings(db_path: Path) -> None:
                     "constraints": {},
                 }
             ],
-            "backends": [
-                {
-                    "tenant_id": "acme",
-                    "base_url": "http://127.0.0.1:9000",
-                    "token_ref": MASKED_SECRET,
-                    "timeout_ms": 5000,
-                }
-            ],
             "settings": {"workers_per_channel": MASKED_SECRET},
         }
         again = await runtime.apply_config(ConfigDocument.model_validate(masked))
-        assert again == {"channels": 1, "backends": 1, "settings": 0}
+        assert again == {"channels": 1, "settings": 0}
         stored = runtime.store.get_channel(CHANNEL_ID)
         assert stored is not None
         assert stored.name == "Renamed"
         assert stored.config["app_secret"] == "literal-secret"
         assert stored.config["nested"]["token"] == "literal-inner-token"
-        backend = runtime.store.get_backend("acme")
-        assert backend is not None and backend.token_ref == "literal-backend-token"
         assert runtime.store.get_setting("workers_per_channel") == 2
         # Alias/name-only import does not restart the live instance.
         assert len(manager.added) == 1
 
         deleted = await runtime.apply_config(
-            ConfigDocument.model_validate({"version": 1, "channels": [], "backends": [], "settings": {}})
+            ConfigDocument.model_validate({"version": 2, "channels": [], "settings": {}})
         )
-        assert deleted == {"channels": 0, "backends": 0, "settings": 0}
+        assert deleted == {"channels": 0, "settings": 0}
         assert runtime.store.get_channel(CHANNEL_ID) is None
-        assert runtime.store.get_backend("acme") is None
         assert manager.removed == [CHANNEL_ID]
 
 
@@ -667,23 +640,14 @@ async def test_apply_config_add_failure_becomes_warning(db_path: Path) -> None:
     manager.fail_add_kinds.add("wecom")
     async with running_runtime(db_path, manager=manager) as (runtime, _manager):
         document = {
-            "version": 1,
+            "version": 2,
             "channels": [
                 {
                     "channel_id": "wecom:acme:ops",
                     "kind": "wecom",
-                    "tenant_id": "acme",
                     "enabled": True,
                     "config": {"bot_id": "b"},
                     "constraints": {},
-                }
-            ],
-            "backends": [
-                {
-                    "tenant_id": "acme",
-                    "base_url": "http://127.0.0.1:9000",
-                    "token_ref": "${WECOM_TOKEN}",
-                    "timeout_ms": 1000,
                 }
             ],
             "settings": {},
@@ -699,18 +663,16 @@ async def test_apply_config_add_failure_becomes_warning(db_path: Path) -> None:
 async def test_apply_config_adds_disabled_channel(db_path: Path) -> None:
     async with running_runtime(db_path) as (runtime, manager):
         document = {
-            "version": 1,
+            "version": 2,
             "channels": [
                 {
                     "channel_id": "feishu:acme:off",
                     "kind": "feishu",
-                    "tenant_id": None,
                     "enabled": False,
                     "config": {"app_id": "x"},
                     "constraints": {},
                 }
             ],
-            "backends": [],
             "settings": {},
         }
         await runtime.apply_config(ConfigDocument.model_validate(document))
@@ -729,46 +691,28 @@ async def test_apply_config_recovers_unregistered_channel(db_path: Path) -> None
         assert len(manager.added) == 2
 
 
-async def test_apply_config_rejects_masked_new_backend_and_empty_fields(db_path: Path) -> None:
+async def test_apply_config_rejects_removed_routing_document(db_path: Path) -> None:
+    """A version-1 document cannot even be parsed anymore (no backend layer)."""
     async with running_runtime(db_path) as (runtime, _manager):
-        masked_new_backend = {
-            "version": 1,
-            "channels": [],
-            "backends": [{"tenant_id": "new", "base_url": "http://x", "token_ref": MASKED_SECRET}],
-            "settings": {},
-        }
-        with pytest.raises(ValueError, match="打码"):
-            await runtime.apply_config(ConfigDocument.model_validate(masked_new_backend))
-
-        empty_token = {
-            "version": 1,
-            "channels": [],
-            "backends": [{"tenant_id": "t", "base_url": "http://x", "token_ref": "  "}],
-            "settings": {},
-        }
-        with pytest.raises(ValueError, match="token_ref"):
-            await runtime.apply_config(ConfigDocument.model_validate(empty_token))
-
-        empty_url = {
-            "version": 1,
-            "channels": [],
-            "backends": [{"tenant_id": "t", "base_url": "  ", "token_ref": "${T}"}],
-            "settings": {},
-        }
-        with pytest.raises(ValueError, match="base_url"):
-            await runtime.apply_config(ConfigDocument.model_validate(empty_url))
-        assert runtime.store.list_backends() == []
+        with pytest.raises(ValueError, match="tenant/backends"):
+            ConfigDocument.model_validate(
+                {
+                    "version": 1,
+                    "channels": [],
+                    "backends": [{"tenant_id": "t", "base_url": "http://x", "token_ref": "${T}"}],
+                }
+            )
+        assert runtime.store.list_channels() == []
 
 
 async def test_apply_config_rejects_non_dict_config_and_bad_settings(db_path: Path) -> None:
     async with running_runtime(db_path) as (runtime, _manager):
         bad_config = ConfigDocument.model_construct(
-            version=1,
+            version=2,
             channels=[
                 ChannelConfigEntry.model_construct(
                     channel_id="c1",
                     kind="feishu",
-                    tenant_id=None,
                     alias=None,
                     name="",
                     enabled=False,
@@ -776,14 +720,13 @@ async def test_apply_config_rejects_non_dict_config_and_bad_settings(db_path: Pa
                     constraints={},
                 )
             ],
-            backends=[],
             settings={},
         )
         with pytest.raises(ValueError, match="必须是 JSON 对象"):
             await runtime.apply_config(bad_config)
 
         bad_settings = ConfigDocument.model_construct(
-            version=1, channels=[], backends=[], settings={"bad": object()}
+            version=2, channels=[], settings={"bad": object()}
         )
         with pytest.raises(ValueError, match="可序列化"):
             await runtime.apply_config(bad_settings)
@@ -839,7 +782,6 @@ async def test_apply_config_alias_conflict_is_rejected(db_path: Path) -> None:
         first = ChannelConfigEntry(
             channel_id=CHANNEL_ID,
             kind="feishu",
-            tenant_id="acme",
             alias="dup",
             name="A",
             enabled=True,
@@ -849,16 +791,13 @@ async def test_apply_config_alias_conflict_is_rejected(db_path: Path) -> None:
         second = ChannelConfigEntry(
             channel_id="feishu:acme:other",
             kind="feishu",
-            tenant_id="acme",
             alias="dup",
             name="B",
             enabled=True,
             config={"app_id": "cli_x"},
             constraints={},
         )
-        document = ConfigDocument.model_construct(
-            version=1, channels=[first, second], backends=[], settings={}
-        )
+        document = ConfigDocument.model_construct(version=2, channels=[first, second], settings={})
         with pytest.raises(ValueError, match="已被通道"):
             await runtime.apply_config(document)
 
@@ -1030,7 +969,6 @@ class AppHarness:
             json={
                 "channel_id": CHANNEL_ID,
                 "kind": "feishu",
-                "tenant_id": "acme",
                 "alias": "sales",
                 "name": "Sales",
                 "enabled": True,
@@ -1134,9 +1072,8 @@ def test_app_config_import_invalid_document_keeps_db(app_harness: AppHarness) ->
     response = app_harness.client.post(
         "/v1/config/import",
         json={
-            "version": 1,
+            "version": 2,
             "channels": [{"channel_id": "bad", "kind": "not-a-kind"}],
-            "backends": [{"tenant_id": "", "base_url": "http://x", "token_ref": "${T}"}],
         },
         headers=AUTH,
     )
@@ -1175,12 +1112,11 @@ def test_app_config_import_pydantic_validation_is_400(app_harness: AppHarness) -
     response = app_harness.client.post(
         "/v1/config/import",
         json={
-            "version": 1,
+            "version": 2,
             "channels": [
                 {"channel_id": "dup", "kind": "feishu"},
                 {"channel_id": "dup", "kind": "feishu"},
             ],
-            "backends": [{"tenant_id": "", "base_url": "http://x", "token_ref": "${T}"}],
         },
         headers=AUTH,
     )

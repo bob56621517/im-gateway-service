@@ -7,7 +7,6 @@ Gateway code should import :class:`Store` and the record types from here::
 
 from im_gateway.db.models import (
     DIRECTIONS,
-    BackendRecord,
     ChannelRecord,
     MessageRecord,
     SubjectRecord,
@@ -24,7 +23,6 @@ __all__ = [
     "LATEST_SCHEMA_VERSION",
     "MIGRATIONS",
     "SCHEMA_VERSION",
-    "BackendRecord",
     "ChannelRecord",
     "MessageRecord",
     "Store",

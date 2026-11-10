@@ -532,7 +532,7 @@ class FrameKind(StrEnum):
 class ChannelRef(BaseModel):
     channel_id: str                  # 全局路由主键，显式命名，如 feishu:tenant-a:sales
     kind: str                        # octop 的 channel_type
-    tenant_id: str | None = None
+    tenant_id: str | None = None     # 冻结字段；v2 起恒为 ""，见 §16
 
 class SubjectRef(BaseModel):
     subject_id: str
@@ -661,7 +661,7 @@ class TurnFrame(BaseModel):
 
 | 类别 | 内容 | 生命周期 | 存在哪 |
 |---|---|---|---|
-| **持久状态（唯一权威）** | 声明式配置：`channels` / `backends` / `settings`；运行数据：`messages` / `turn_events` / `subjects` / `inbound_dedup` / `audit` / `schema_migrations` | 重启恢复 | **SQLite 单库** |
+| **持久状态（唯一权威）** | 声明式配置：`channels` / `settings`；运行数据：`messages` / `turn_events` / `subjects` / `inbound_dedup` / `audit` / `schema_migrations` | 重启恢复 | **SQLite 单库** |
 | **bootstrap（不可消除的最小例外）** | ① db 文件路径 ② 控制面监听（UDS 路径或 TCP 端口）③ token 文件路径 | 打开 DB 之前必须知道 | 环境变量 / 命令行参数（都有默认值） |
 | **进程内存（重启即丢）** | manager 的通道注册表/队列/worker/session 锁；通道内 subject 注册表；群上下文缓冲；各通道 ws 连接与游标；扫码登录会话 | 重建或丢弃 | 内存（不可控的见 §11.2） |
 | **不持有 / 只留引用** | agent 的 thread 与对话记忆、媒体二进制 | — | 后端自己存；媒体在 media_dir（DB 只存 key） |
@@ -759,17 +759,23 @@ CREATE TABLE turn_events (                   -- 可选：原始帧，仅排障 /
 );
 ```
 
+> **2026-11-10 更新（§16）：仅保留 `channels` / `settings` 等。`backends` 表与
+> `channels.tenant_id` 已在 schema v2 迁移中删除；网关只认一个后端 URL。以下 §13.2
+> 代码块是 v1 历史定义。**
+
 字段决定：
 
 - `channel_id` 不可变；`alias`（唯一短名，CLI 解析用）+ `name`（显示名）都可变。
 - `created_at` 回答「添加时间」；`last_started_at` 仅诊断。
 - 删 channel 默认保留 `subjects`/`messages`；`--purge` 才级联。
-- `settings` 里放：`workers_per_channel`、`queue_maxsize`、`log_level`、`turn_deadline_ms`、`error_texts`、`retention.*`。
+- `settings` 里放：`workers_per_channel`、`queue_maxsize`、`log_level`、`error_texts`、`retention.*`。
+  （后端超时不再来自 settings/backends，而是 `IMGW_BACKEND_TIMEOUT_MS`，见 §16。）
 
 ### 13.3 「全局唯一的 webhook」澄清
 
 - **A 模式下 webhook 是后端的**：后端实现 `POST /v1/turns`；网关不暴露公网 webhook（10 通道全部出站，零公网 IP）。
-- **单后端部署 = `backends` 只有 `tenant_id=''` 一行**；多租户时多行，按 `channels.tenant_id` 路由。
+- ~~**单后端部署 = `backends` 只有 `tenant_id=''` 一行**；多租户时多行，按 `channels.tenant_id` 路由。~~
+  **2026-11-10 起（§16）：后端就是一个 URL（`--backend-url` / `IMGW_BACKEND_URL`），不再有 `backends` 表或 tenant 路由。**
 - 网关的 HTTP 面是**控制面**（UDS 或 loopback + token），不是平台回调入口。
 
 ### 13.4 修改路径、离线模式与备份
@@ -781,7 +787,7 @@ CLI ──HTTP──▶ daemon：校验 → 事务写 SQLite → 应用到 manag
 ```
 
 - 没有 `sync` 命令、没有 reconcile 引擎：改与生效是同一次调用。
-- 单实体变更语义固定：新增 → `add_channel`；删除 → `remove_channel`；`kind/config/tenant` 变 → `remove_channel` + `add_channel`（上游无 update API）；仅 `alias/name` → 原地更新；`enabled` 翻转 → add/remove。
+- 单实体变更语义固定：新增 → `add_channel`；删除 → `remove_channel`；`kind/config` 变 → `remove_channel` + `add_channel`（上游无 update API）；仅 `alias/name` → 原地更新；`enabled` 翻转 → add/remove。
 
 **离线模式**（daemon 不在时，不给第二套存储格式）：
 
@@ -844,12 +850,12 @@ CLI ──HTTP──▶ daemon：校验 → 事务写 SQLite → 应用到 manag
 | 命令 | 作用 | 调控制面 | 触碰状态 / 上游 |
 |---|---|---|---|
 | `imgw run` | **唯一生产启动进程**：迁移 → 读 DB → reconcile channels → 起 uvicorn | 无（进程本身） | 全量 |
-| `imgw run-dev [--dev-backend-port 9900]` | 开发模式：同进程拉起回显后端，所有 tenant 走它（**不写 backends 行**），其余机制（messages/subjects/dedup/audit）照旧 | 无（进程本身） | 全量 |
+| `imgw run-dev [--dev-backend-port 9900]` | 开发模式：同进程拉起回显后端，并把**全局 backend URL** 指向它，其余机制（messages/subjects/dedup/audit）照旧 | 无（进程本身） | 全量 |
 | `imgw install-service [--dry-run] [--print-only] [--user/--system] [--workdir]` | 生成并安装 systemd / launchd / NSSM 定义（`--print-only` 只打印，`--dry-run` 不写不执行） | 无 | 服务定义文件 + 系统命令 |
 | `imgw uninstall-service` / `start [--wait]` / `stop` / `restart` | 生命周期转发给系统服务管理器；`start --wait` 轮询 `/readyz` | `GET /readyz`（仅 `--wait`） | 系统服务 |
 | `imgw start [--wait]` / `stop` / `restart` | 转发给系统服务管理器；`--wait` 轮询 `/readyz` | `GET /readyz` | 系统服务 |
 | `imgw status [--json]` | 守护进程 + 每通道状态 | `GET /v1/status` | 内存 + DB |
-| `imgw channel login <target> [--id --name --tenant --config --app-id/--app-secret/--bot-id/--secret/--app-key/--token/--account-id/--base-url --secret-stdin --rescan --check --format --json --qr-png --timeout --interval --no-wait --session-id]` | 绑定/重登：kind 建号、无凭据扫码、有凭据重连、凭据参数静默/覆盖、`--rescan` 强制扫码；`--format both|url|qr|json` 控制输出（stdout 数据、stderr 提示） | `GET /v1/channels/{ref}` → `POST /v1/channels` / `PATCH /v1/channels/{ref}` → `POST /v1/channels/{ref}/login` + 轮询 | DB + manager + QR 助手 |
+| `imgw channel login <target> [--id --name --config --app-id/--app-secret/--bot-id/--secret/--app-key/--token/--account-id/--base-url --secret-stdin --rescan --check --format --json --qr-png --timeout --interval --no-wait --session-id]` | 绑定/重登：kind 建号、无凭据扫码、有凭据重连、凭据参数静默/覆盖、`--rescan` 强制扫码；`--format both|url|qr|json` 控制输出（stdout 数据、stderr 提示）；**无 `--tenant`（§16）** | `GET /v1/channels/{ref}` → `POST /v1/channels` / `PATCH /v1/channels/{ref}` → `POST /v1/channels/{ref}/login` + 轮询 | DB + manager + QR 助手 |
 | `imgw channel logout <ref>` | 停用（=旧 disable），保留凭据、subjects/messages；幂等 | `PATCH /v1/channels/{ref}` `{"enabled": false}` | DB + manager |
 | `imgw channel list [<ref>] [--json] [--header]` | 无参：TSV 列表（channel_id/kind/state/creds/alias）；带 ref：详情（含脱敏 config）；secret 永不输出 | `GET /v1/channels` / `GET /v1/channels/{ref}` | DB + manager |
 | `imgw channel delete <ref> [--purge] [--yes]` | 删行；**要求先 logout**（否则 409）；`--purge` 级联 subjects/messages | `DELETE /v1/channels/{ref}` | DB + `manager.remove_channel` |
@@ -864,6 +870,17 @@ CLI ──HTTP──▶ daemon：校验 → 事务写 SQLite → 应用到 manag
 | `imgw db backup <path>` / `vacuum` / `migrate` | 备份 / 压缩 / 迁移 | `POST /v1/db/maintenance` 或离线 | SQLite |
 | `imgw doctor` | 自检：DB 完整、media 可写、backend 可达、凭证 probe、字面 secret 告警 | 组合调用 | 只读 + probe |
 | `imgw version` | 本地 CLI 与 daemon 版本 | `GET /v1/version` | — |
+
+> **2026-11-10 更新（§16）**：`imgw run` 增加 `--backend-url`；`channel login` 删除
+> `--tenant`；`status` 的 backends 计数换成只读 `backend_url`；`run-dev` 改为把全局
+> backend URL 指向进程内回显后端。上表相应旧描述以 §16 为准。
+>
+> **登录超时语义（task-3）**：`--timeout` 默认 900s，既是 CLI 总等待上限，也是平台支持时的
+> 二维码有效期（微信 `wait_for_login` / 飞书本地等待取 min）；钉钉/企微跟随平台。平台回传 TTL
+> 时（钉钉 `expires_in`、飞书 `expireIn`）`POST /v1/channels/{ref}/login` 的响应带
+> `expires_in_s`，CLI 据此打印一行扫码提示（App + 有效期 + 兜底链接；未知则不显示有效期），
+> 并把等待钳制在 `min(--timeout, TTL+5s)`。daemon 登录会话**默认无超时**
+> （`LoginManager(session_ttl_s=None)`），仅显式 `IMGW_LOGIN_SESSION_TTL` 时启用。
 
 ### 13.8 铁律
 
@@ -904,11 +921,11 @@ CLI ──HTTP──▶ daemon：校验 → 事务写 SQLite → 应用到 manag
 ### 13.10 开发模式：dev-backend（调试套件）
 
 - 源码套件：`src/im_gateway/dev/backend.py`，暴露 `create_dev_backend_app(token="")` 与 `python -m im_gateway.dev.backend --port 9900`。
-- 契约：`POST /v1/turns` 接收 `kind=start` 帧，SSE 返回 **一帧 `message` + 一帧 `completed`**；`message` 用固定文本一次性返回 `channel_id / channel_kind / tenant_id / subject_id / subject_name / chat_type / session_key / turn_id / idempotency_key / message`，方便通道开发者对照“网关实际收到了什么”。
+- 契约：`POST /v1/turns` 接收 `kind=start` 帧，SSE 返回 **一帧 `message` + 一帧 `completed`**；`message` 用固定文本一次性返回 `channel_id / channel_kind / subject_id / subject_name / chat_type / session_key / turn_id / idempotency_key / message`，方便通道开发者对照“网关实际收到了什么”。
 - 两种用法：
-  1. `imgw run-dev [--dev-backend-port 9900]`：进程内起 uvicorn 线程，`BackendRouter(override=...)` 让**所有 tenant** 都路由到它，不写 `backends` 表；控制面退出时一起停；
-  2. 独立跑：`uv run python -m im_gateway.dev.backend`，按普通 backend 注册（可带 `--token`）。
-- 仅用于调试：不写 backends 配置、不做真实业务；独立子命令 `run-dev` 即显式开关，生产入口仍是 `run`。
+  1. `imgw run-dev [--dev-backend-port 9900]`：进程内起 uvicorn 线程，并把**全局 backend URL** 指向它（不再是 `BackendRouter(override=...)` 的 tenant 覆盖，见 §16）；控制面退出时一起停；
+  2. 独立跑：`uv run python -m im_gateway.dev.backend`，把 `--backend-url` 指向它即可（可带 `--token`）。
+- 仅用于调试：不写后端配置（schema v2 起也没有 `backends` 表）、不做真实业务；独立子命令 `run-dev` 即显式开关，生产入口仍是 `run`。
 
 ---
 
@@ -921,7 +938,7 @@ CLI ──HTTP──▶ daemon：校验 → 事务写 SQLite → 应用到 manag
 | D-01 | 形态 | 单包两面具：`imgw run` 起 uvicorn + FastAPI + ChannelManager（同 loop）；CLI 只做 HTTP 客户端；不自 daemonize；`install-service` 生成 systemd/launchd/NSSM |
 | D-02 | 入站投递 | **模型 A**（webhook 流式派发）：后端实现唯一 `POST /v1/turns`；网关 → 后端；SSE 流；必须是异步生成器 |
 | D-03 | 线上契约 | **单一 `TurnFrame` 信封**：request body = `kind=start` 首帧；response = 同构帧序列；11 种 kind（含 `native`）；`capabilities` 随 `start` 下发；必须有终止帧（§12） |
-| D-04 | 配置存储 | **SQLite**（channels/backends/settings）；CLI→API→DB 即时生效；无 sync/无文件配置 |
+| D-04 | 配置存储 | **SQLite**（channels/settings；schema v2 起无 backends）；CLI→API→DB 即时生效；无 sync/无文件配置 |
 | D-05 | 运行数据 | **同一 SQLite**：messages/turn_events/subjects/inbound_dedup/audit/schema_migrations |
 | D-06 | 配置文件 | 仅作 **JSON 导入/导出**（`config export/import`）+ JSON Schema 校验；不是运行时配置源 |
 | D-07 | 密钥 | DB 存 `${ENV}` 引用，内存展开；写回/导出永远保留占位符；字面量仅限扫码所得 token 并告警 |
@@ -972,14 +989,14 @@ CLI ──HTTP──▶ daemon：校验 → 事务写 SQLite → 应用到 manag
 |---|---|
 | 工程 | `pyproject.toml`（uv + hatchling，pin `octop-gateway==1.0.3`，pytest/ruff/mypy/pytest-cov 配置） |
 | `core/` | `contracts.py`（`TurnFrame` 11 种帧 + 逐帧校验 + 上游互转 + metadata JSON 清洗）、`config.py`（`ConfigDocument`）、`capabilities.py`（10 通道初始 capability 表）、`paths.py`（bootstrap 三项 + 0600 token） |
-| `db/` | 9 张表（§13.2）+ `Store`（短连接/线程安全、迁移、分批 prune、`VACUUM INTO` 备份、幂等 claim） |
+| `db/` | 8 张表（schema v2；§13.2/§16）+ `Store`（短连接/线程安全、迁移、分批 prune、`VACUUM INTO` 备份、幂等 claim） |
 | `gateway/` | `app.py`（§13.6 全部路由 + 鉴权 + 错误映射 + SSE）、`runtime.py`（Store↔ChannelManager 接线、状态机、config import、优雅停机）、`factory.py`（per-kind config，weixin 特判）、`events.py`（进程内 SSE 总线）、`processor.py`（**模型 A 实现**）、`idempotency.py`（8 通道 msg id 提取 + hash 兜底）、`maintenance.py`（retention 调度）、`login.py`（扫码登录状态机 + QQ/微信 adapter）、`dev_processor.py`（echo 占位，仅测试/自检用） |
 | `cli/` | 17 个命令（新增 `channel login`、`run-dev`），httpx 客户端（UDS/TCP、token、SSE）、segno 二维码；`service.py`（systemd/launchd/NSSM 生成 + 生命周期命令） |
 | 文档 | `README.md`、本文件 §12~§15 |
 
 ### 15.2 已接通的关键行为（都有单测钉住）
 
-1. **模型 A processor**：幂等 claim → 入站消息落库 → `subjects` upsert（过滤临时字段）→ 按 tenant 选后端（`${ENV}` 展开）→ 构造 `start` 帧（含 capability）→ SSE 逐帧解析 + `seq` 严格 +1 校验 → 转 `MessageEvent`；**恰好一个终止事件**；所有异常在流内转成中文 `ERROR`，`CancelledError` 透传；上游 `aclose` 早停时 HTTP client 确定性关闭。
+1. **模型 A processor**：幂等 claim → 入站消息落库 → `subjects` upsert（过滤临时字段）→ 用全局 backend URL 构造 `start` 帧（含 capability，附 `X-Imgw-*` 分发头，§16）→ SSE 逐帧解析 + `seq` 严格 +1 校验 → 转 `MessageEvent`；**恰好一个终止事件**；所有异常在流内转成中文 `ERROR`，`CancelledError` 透传；上游 `aclose` 早停时 HTTP client 确定性关闭。
 2. **metadata 清洗**：WeCom 等适配器会把 live SDK 对象（`_frame` / `_ws_client`）放进 `InboundMessage.metadata`；网关在写 wire body 与 SQLite 前统一剔除，避免正常消息退化成内部错误（回归测试见 `tests/test_processor.py` + `tests/test_contracts.py`）。
 3. **落库**：入站一条 + 出站最终内容一条（DELTA 合并，不落 token 碎片）；`subjects` 每条入站刷新；`inbound_dedup` 拦截平台重投；`audit` 记录管理动作。
 4. **优雅停机**：`settings.shutdown_grace_ms`（默认 10s）内等待 `active_turns` 归零，再 `manager.stop()`。
@@ -1000,10 +1017,10 @@ CLI ──HTTP──▶ daemon：校验 → 事务写 SQLite → 应用到 manag
 ### 15.4 测试与覆盖率
 
 ```
-uv run pytest -q                        451 passed
+uv run pytest -q                        527 passed
 uv run ruff check src tests             All checks passed
-uv run mypy                             Success: no issues found (25 source files, strict)
-uv run pytest --cov=im_gateway           TOTAL 3400 stmts, 125 miss, 96%
+uv run mypy src                         Success: no issues found (29 source files)
+uv run pytest --cov=im_gateway          TOTAL 3400 stmts, 125 miss, 96%
 # 未覆盖分支主要是 feishu/wecom/dingtalk 三个扫码 adapter 的真实 HTTP/线程调用；
 # 离线单测覆盖了全部状态机与错误映射，平台网络分支由真机冒烟验证。
 ```
@@ -1030,3 +1047,67 @@ uv run pytest --cov=im_gateway           TOTAL 3400 stmts, 125 miss, 96%
 2. 企微（原生流 + 10s 占位）与 QQ；再 weixin（会话过期重扫码）。
 3. outbox / delivery 状态 / backend 可达性 doctor。
 4. 双模式 CI 占位（1 节点 SQLite / 3 节点 PG+Redis），为 v2 留出测试结构。
+
+---
+
+## 16. 架构简化：后端「一个 URL，POST only」（2026-11-10，GitHub issue #3）
+
+> 用户已批准。目标：网关**不再管理后端路由**。本文档 §13.2（backends/channels.tenant_id）、
+> §13.3（单后端多行）、§13.7（run-dev/--tenant/status backends）中被本节取代的部分，以本节为准。
+> `TurnFrame` 线上信封（§12）不变。
+
+### 16.1 结论
+
+| 项 | 结论 |
+|---|---|
+| 后端寻址 | 仅一个 URL。优先级：`imgw run --backend-url` > `IMGW_BACKEND_URL` > `http://127.0.0.1:8080` |
+| 契约 | 仅 `POST {url}/v1/turns`；body = `TurnFrame(kind=start)`，response = SSE 帧流。**无健康检查/探测/注册/校验** |
+| 鉴权 | 可选 `IMGW_BACKEND_TOKEN`：设置则发 `Authorization: Bearer <token>`，未设置则**完全省略**该头 |
+| 超时 | 可选 `IMGW_BACKEND_TIMEOUT_MS`（默认 120000），取代 per-backend timeout |
+| 分发头 | 每次 POST 附 `X-Imgw-Channel-Id`、`X-Imgw-Channel-Name`（名字为空则省略）、`X-Imgw-Kind` |
+| 多租户 | **删除**：无 `backends` 表、无 `channels.tenant_id`、无 per-tenant 路由、无 CLI `--tenant` |
+
+### 16.2 Schema v1 → v2（迁移）
+
+```sql
+-- Store.migrate() 自动执行；幂等、单事务
+DROP TABLE IF EXISTS backends;
+ALTER TABLE channels DROP COLUMN tenant_id;   -- SQLite >= 3.35（bundled Python 3.12 满足）
+```
+
+- `SCHEMA_VERSION = 2`，`schema_migrations` 记录 1、2；迁移后 `channels` / `messages` / `subjects`
+  等历史数据保留（仅删列/删表）。
+- `BackendRecord`、`Store.list_backends/get_backend/upsert_backend/delete_backend` 删除；
+  `TABLES` / `table_counts()` 不再有 `backends`。
+
+### 16.3 配置文档 v2
+
+- `ConfigDocument.version = 2`（唯一接受的版本）。
+- 删除 `BackendConfigEntry` 与 `ConfigDocument.backends`、`ChannelConfigEntry.tenant_id`。
+- 解析 v1 文档 → 明确错误，提示 `tenant/backends` 路由层已移除；v2 文档仍带 `backends` /
+  `tenant_id` 也被明确拒绝（`extra="forbid"` + 前置校验）。
+- `config export` 输出 v2、无 backends 段。
+
+### 16.4 实现落点
+
+| 模块 | 变化 |
+|---|---|
+| `gateway/processor.py` | 删除 `BackendRouter`；新增 `BackendSpec`、`resolve_backend_spec()`（flag/env/default）、`resolve_backend_url()`（未来 seam）；`TurnProcessor(store, backend)`；`_request_headers()` 注入分发头 |
+| `gateway/runtime.py` | `GatewayRuntime(..., backend=BackendSpec)`；删除 apply_config 的 backends 分支与 tenant 字段；新增只读 `backend_url` |
+| `gateway/app.py` | `/v1/status` 用 `backend_url` 取代 backends 计数；`run_daemon(backend_url=...)`；`run-dev` 用 `dataclasses.replace` 把 base_url 指向回显后端 |
+| `cli/main.py` | `run --backend-url`；删除 `channel login --tenant`；`status` 显示 `backend_url`；help/i18n 同步 |
+| `core/contracts.py` | `ChannelRef.tenant_id` **保留**（冻结 wire 字段），`start_from_inbound` 固定写 `""`；`InboundMessage.tenant_id` 不再参与路由 |
+| `db/` | schema v2 迁移；records/store 删除 backend/tenant |
+
+### 16.5 未来 seam（只加函数，不暴露）
+
+- 通道 config（普通 JSON 键，无新表/列）可带 `backend_url`；`resolve_backend_url(channel_config, global_url)`
+  负责解析，缺省/空值回退全局 URL。
+- 无 CLI 参数、无 help 文案；不改变 `TurnFrame` 契约。后续若要正式支持，再决定是否提升为显式配置项。
+
+### 16.6 验证
+
+- `tests/test_db.py`：v1 fixture → `migrate()` → `backends` 表与 `channels.tenant_id` 消失、数据保留。
+- `tests/test_processor.py`：单 URL、`X-Imgw-*` 头、空 token 省略 Authorization、per-channel URL seam。
+- `tests/test_config.py` / `tests/test_gateway.py`：v1/残留字段拒绝、v2 导出/导入。
+- `tests/test_cli*.py` / `tests/test_i18n.py`：`run --backend-url` 透传、无 `--tenant`、`status` 的 `backend_url`、en/zh 帮助。

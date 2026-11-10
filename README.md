@@ -23,7 +23,8 @@
 ```
 
 - **模型 A**：入站消息 → `POST {backend}/v1/turns`（SSE 返回统一 `TurnFrame`）→ 帧转成通道回复，终态必为 `completed` / `error`；
-- **多租户**：通道按 `tenant_id` 路由到不同后端；`imgw run-dev` 时所有 tenant 被内存覆盖到内置回显后端；
+- **单一后端 URL**：后端只需「一个 URL，只收 POST」。URL 优先级 `imgw run --backend-url` > `IMGW_BACKEND_URL` > 默认 `http://127.0.0.1:8080`；没有健康检查、探测、注册，也没有多租户路由。可选 `IMGW_BACKEND_TOKEN`（`Authorization: Bearer`）与 `IMGW_BACKEND_TIMEOUT_MS`（默认 120000）；
+- **分发头**：每次 POST 附带 `X-Imgw-Channel-Id` / `X-Imgw-Channel-Name`（名字为空时省略）/ `X-Imgw-Kind`，后端据此区分通道；
 - **CLI 是纯 HTTP 客户端**：不直接碰数据库，所有写操作经控制面；secret 在视图中一律脱敏。
 
 ## 快速开始
@@ -33,6 +34,9 @@ uv sync --all-groups                     # 安装依赖（octop-gateway==1.0.3 �
 uv run imgw --help                       # 权威用法文档（每个子命令同样支持 --help）
 
 uv run imgw run                          # 前台启动 daemon（唯一启动进程的命令）
+# 或显式指定后端：
+uv run imgw run --backend-url http://127.0.0.1:8080
+# 等价环境变量：IMGW_BACKEND_URL / IMGW_BACKEND_TOKEN / IMGW_BACKEND_TIMEOUT_MS
 # 另开终端：
 uv run imgw status                       # 默认 tcp://127.0.0.1:8765；token 自动生成/读取
 uv run imgw channel login feishu --name sales   # 扫码建号（飞书/企微/钉钉/QQ/微信）
@@ -46,6 +50,7 @@ uv run imgw doctor                       # 自检
 
 ```bash
 uv run imgw run-dev                      # 回显后端默认 127.0.0.1:9900（--dev-backend-port 可改）
+# run-dev 只把全局 backend URL 指向进程内回显后端，token/超时/历史/去重等机制不变
 ```
 
 系统服务：`uv run imgw install-service`（默认用户级 systemd / launchd / NSSM；`--system` 需 root；`--print-only` 只生成）。
@@ -66,7 +71,7 @@ tests/          契约 / 配置 / DB / 控制面 / processor / 登录 / i18n / C
 ## 开发门禁
 
 ```bash
-uv run pytest -q                         # 513 passed
+uv run pytest -q                         # 527 passed
 uv run ruff check src tests
 uv run mypy src
 ```

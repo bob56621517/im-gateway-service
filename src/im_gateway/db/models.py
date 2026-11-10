@@ -1,4 +1,4 @@
-"""Typed row objects for the SQLite persistence layer (HANDOVER §13.2).
+"""Typed row objects for the SQLite persistence layer (HANDOVER §13.2, §16).
 
 These are deliberately plain frozen dataclasses rather than pydantic models:
 the persistence layer must not depend on the wire contract, and callers
@@ -20,7 +20,6 @@ from typing import Any, Final
 
 __all__ = [
     "DIRECTIONS",
-    "BackendRecord",
     "ChannelRecord",
     "MessageRecord",
     "SubjectRecord",
@@ -32,11 +31,14 @@ DIRECTIONS: Final[frozenset[str]] = frozenset({"in", "out"})
 
 @dataclass(frozen=True, slots=True)
 class ChannelRecord:
-    """One row of ``channels`` — a single running channel instance."""
+    """One row of ``channels`` — a single running channel instance.
+
+    Schema v2 has no ``tenant_id``: the gateway no longer routes per tenant
+    (GitHub issue #3).
+    """
 
     channel_id: str
     kind: str
-    tenant_id: str | None
     alias: str | None
     name: str
     config: dict[str, Any]
@@ -45,22 +47,6 @@ class ChannelRecord:
     created_at: float
     updated_at: float
     last_started_at: float | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class BackendRecord:
-    """One row of ``backends`` — an agent backend webhook destination.
-
-    ``tenant_id == ""`` is the default single-backend deployment.
-    """
-
-    tenant_id: str
-    base_url: str
-    token_ref: str
-    timeout_ms: int
-    enabled: bool
-    created_at: float
-    updated_at: float
 
 
 @dataclass(frozen=True, slots=True)

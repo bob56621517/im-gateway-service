@@ -12,7 +12,7 @@ from typing import Any
 import pytest
 
 from im_gateway.db import (
-    BackendRecord,
+    MIGRATIONS,
     ChannelRecord,
     MessageRecord,
     Store,
@@ -48,7 +48,6 @@ def make_channel(
     values: dict[str, Any] = {
         "channel_id": channel_id,
         "kind": "feishu",
-        "tenant_id": "acme",
         "alias": alias,
         "name": "Sales",
         "config": {"app_id": "cli_x", "app_secret": "${FEISHU_APP_SECRET}"},
@@ -141,14 +140,13 @@ def test_migrate_is_idempotent_and_sets_pragmas(db_path: Path) -> None:
             if not row[0].startswith("sqlite_")
         }
 
-    assert versions == [1]
+    assert versions == [1, 2]
     assert journal_mode == "wal"
     assert auto_vacuum == 2  # INCREMENTAL
     assert tables == {
         "schema_migrations",
         "settings",
         "channels",
-        "backends",
         "subjects",
         "inbound_dedup",
         "audit",
@@ -157,8 +155,64 @@ def test_migrate_is_idempotent_and_sets_pragmas(db_path: Path) -> None:
     }
     counts = store.table_counts()
     assert set(counts) == tables
-    assert counts["schema_migrations"] == 1
+    assert counts["schema_migrations"] == 2
     assert all(count == 0 for table, count in counts.items() if table != "schema_migrations")
+    assert store.integrity_check() == "ok"
+
+
+def test_migrate_v1_to_v2_drops_tenant_and_backends_keeps_data(db_path: Path) -> None:
+    """A schema-v1 database upgrades in place: no backends table, no tenant column."""
+    with raw_connection(db_path) as conn:
+        conn.executescript(MIGRATIONS[1])
+        conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (1, 0)")
+        conn.execute(
+            """
+            INSERT INTO channels(
+              channel_id, kind, tenant_id, alias, name, config_json,
+              constraints_json, enabled, created_at, updated_at, last_started_at
+            ) VALUES ('feishu:acme:sales', 'feishu', 'acme', 'sales', 'Sales',
+                      '{"app_id": "cli_x"}', '{}', 1, 100.0, 100.0, NULL)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO backends(
+              tenant_id, base_url, token_ref, timeout_ms, enabled, created_at, updated_at
+            ) VALUES ('acme', 'http://127.0.0.1:9000', '${BACKEND_TOKEN}', 5000, 1, 100.0, 100.0)
+            """
+        )
+        conn.execute(
+            "INSERT INTO settings(key, value_json, updated_at) VALUES ('log_level', '\"INFO\"', 1.0)"
+        )
+
+    store = Store(db_path)
+    store.migrate()
+
+    with raw_connection(db_path) as conn:
+        tables = {
+            row[0]
+            for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+            if not row[0].startswith("sqlite_")
+        }
+        versions = [row[0] for row in conn.execute("SELECT version FROM schema_migrations ORDER BY version")]
+        channel_columns = {row[1] for row in conn.execute("PRAGMA table_info(channels)")}
+
+    assert "backends" not in tables
+    assert "tenant_id" not in channel_columns
+    assert versions == [1, 2]
+
+    # Channel data survives the column drop; the backend row is gone with its table.
+    stored = store.get_channel("feishu:acme:sales")
+    assert stored is not None
+    assert (stored.kind, stored.alias, stored.name) == ("feishu", "sales", "Sales")
+    assert stored.config == {"app_id": "cli_x"}
+    assert stored.enabled is True
+    assert store.get_setting("log_level") == "INFO"
+
+    counts = store.table_counts()
+    assert counts["channels"] == 1
+    assert counts["settings"] == 1
+    assert "backends" not in counts
     assert store.integrity_check() == "ok"
 
 
@@ -257,7 +311,6 @@ def test_update_channel_whitelist_and_timestamp(store: Store) -> None:
     updated = store.update_channel(
         record.channel_id,
         kind="wecom",
-        tenant_id="ops",
         alias="sales-2",
         name="Sales 2",
         config={"corp_id": "ww"},
@@ -265,7 +318,6 @@ def test_update_channel_whitelist_and_timestamp(store: Store) -> None:
         enabled=False,
     )
     assert updated.kind == "wecom"
-    assert updated.tenant_id == "ops"
     assert updated.alias == "sales-2"
     assert updated.name == "Sales 2"
     assert updated.config == {"corp_id": "ww"}
@@ -329,50 +381,6 @@ def test_delete_channel_purge_removes_runtime_data(store: Store, db_path: Path) 
     assert counts["subjects"] == 1
     assert counts["messages"] == 0
     assert counts["turn_events"] == 0
-
-
-# ---------------------------------------------------------------------------
-# backends
-# ---------------------------------------------------------------------------
-
-
-def test_backend_upsert(store: Store) -> None:
-    assert store.get_backend("") is None
-    assert store.list_backends() == []
-
-    first = BackendRecord(
-        tenant_id="",
-        base_url="http://127.0.0.1:9000",
-        token_ref="${BACKEND_TOKEN}",
-        timeout_ms=120_000,
-        enabled=True,
-        created_at=100.0,
-        updated_at=100.0,
-    )
-    store.upsert_backend(first)
-    assert store.get_backend("") == first
-    assert store.list_backends() == [first]
-
-    second = dataclasses.replace(
-        first,
-        base_url="http://127.0.0.1:9100",
-        timeout_ms=5_000,
-        enabled=False,
-        created_at=999.0,
-        updated_at=200.0,
-    )
-    store.upsert_backend(second)
-    stored = store.get_backend("")
-    assert stored is not None
-    assert stored.base_url == "http://127.0.0.1:9100"
-    assert stored.timeout_ms == 5_000
-    assert stored.enabled is False
-    assert stored.created_at == 100.0  # creation time survives updates
-    assert stored.updated_at == 200.0
-
-    assert store.delete_backend("") is True
-    assert store.delete_backend("") is False
-    assert store.get_backend("") is None
 
 
 # ---------------------------------------------------------------------------
@@ -595,7 +603,7 @@ def test_backup_creates_openable_snapshot(store: Store, db_path: Path) -> None:
     with raw_connection(dest) as conn:
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         assert conn.execute("SELECT COUNT(*) FROM channels").fetchone()[0] == 1
-        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0] == 2
 
     with pytest.raises(ValueError, match="already exists"):
         store.backup(dest)
@@ -604,17 +612,6 @@ def test_backup_creates_openable_snapshot(store: Store, db_path: Path) -> None:
 def test_table_counts_reports_every_table(store: Store, db_path: Path) -> None:
     store.set_setting("log_level", "INFO")
     store.add_channel(make_channel())
-    store.upsert_backend(
-        BackendRecord(
-            tenant_id="",
-            base_url="http://127.0.0.1:9000",
-            token_ref="${TOKEN}",
-            timeout_ms=1_000,
-            enabled=True,
-            created_at=1.0,
-            updated_at=1.0,
-        )
-    )
     store.upsert_subject(make_subject())
     store.claim_inbound("key", "c1")
     store.add_audit("channel.add", actor="offline-cli")
@@ -623,10 +620,9 @@ def test_table_counts_reports_every_table(store: Store, db_path: Path) -> None:
 
     counts = store.table_counts()
     assert counts == {
-        "schema_migrations": 1,
+        "schema_migrations": 2,
         "settings": 1,
         "channels": 1,
-        "backends": 1,
         "subjects": 1,
         "inbound_dedup": 1,
         "audit": 1,

@@ -22,11 +22,16 @@ from im_gateway.core.contracts import (
     frame_to_message_event,
     start_from_inbound,
 )
-from im_gateway.db.models import BackendRecord, ChannelRecord
+from im_gateway.db.models import ChannelRecord
 from im_gateway.db.store import Store
 from im_gateway.gateway.login import LoginManager, QQLoginAdapter, WeixinLoginAdapter
 from im_gateway.gateway.maintenance import RetentionScheduler
-from im_gateway.gateway.processor import BackendRouter, TurnProcessor, build_processor
+from im_gateway.gateway.processor import (
+    DEFAULT_BACKEND_TIMEOUT_MS,
+    BackendSpec,
+    TurnProcessor,
+    build_processor,
+)
 
 # ---------------------------------------------------------------------------
 # contracts
@@ -90,7 +95,6 @@ def test_add_channel_duplicate_alias_raises(db_path: Path) -> None:
         return ChannelRecord(
             channel_id=channel_id,
             kind="feishu",
-            tenant_id="acme",
             alias=alias,
             name="",
             config={},
@@ -114,7 +118,6 @@ def test_update_channel_duplicate_alias_raises(db_path: Path) -> None:
             ChannelRecord(
                 channel_id=channel_id,
                 kind="feishu",
-                tenant_id="acme",
                 alias=alias,
                 name="",
                 config={},
@@ -134,20 +137,9 @@ def test_update_channel_duplicate_alias_raises(db_path: Path) -> None:
 
 
 def _store_with_backend(db_path: Path) -> Store:
+    """A migrated store; the backend is now a URL, not a table row."""
     store = Store(db_path)
     store.migrate()
-    now = time.time()
-    store.upsert_backend(
-        BackendRecord(
-            tenant_id="",
-            base_url="http://backend.test",
-            token_ref="tok",
-            timeout_ms=2000,
-            enabled=True,
-            created_at=now,
-            updated_at=now,
-        )
-    )
     return store
 
 
@@ -155,12 +147,15 @@ def _message() -> InboundMessage:
     return InboundMessage(
         channel_id="feishu:acme:1",
         channel_type="feishu",
-        tenant_id="acme",
         channel_subject=ChannelSubject(subject_id="ou_1", chat_type="direct"),
         content=[TextContent(text="hi")],
         metadata={"message_id": "om_1"},
         timestamp=1000.0,
     )
+
+
+def _spec() -> BackendSpec:
+    return BackendSpec(base_url="http://backend.test", token="tok", timeout_ms=2000)
 
 
 def _processor(store: Store, body: str) -> TurnProcessor:
@@ -170,7 +165,7 @@ def _processor(store: Store, body: str) -> TurnProcessor:
     transport = httpx.MockTransport(handler)
     return TurnProcessor(
         store,
-        BackendRouter(store),
+        _spec(),
         http_client_factory=lambda: httpx.AsyncClient(transport=transport),
     )
 
@@ -183,16 +178,25 @@ def test_new_async_client_factory() -> None:
     asyncio.run(client.aclose())
 
 
-def test_build_processor_ignores_bad_deadline_setting(db_path: Path) -> None:
+def test_build_processor_defaults_backend_from_env(db_path: Path) -> None:
     store = Store(db_path)
     store.migrate()
-    store.set_setting("turn_deadline_ms", "not-a-number")
     store.set_setting("error_texts", {"backend_down": "自定义"})
+
+    processor = build_processor(store, backend=_spec())
+
+    assert processor.backend.timeout_ms == 2000
+    assert processor.backend.base_url == "http://backend.test"
+    assert processor._error_texts["backend_down"] == "自定义"
+
+
+def test_build_processor_uses_default_backend_timeout(db_path: Path) -> None:
+    store = Store(db_path)
+    store.migrate()
 
     processor = build_processor(store)
 
-    assert processor._default_deadline_ms == 120_000
-    assert processor._error_texts["backend_down"] == "自定义"
+    assert processor.backend.timeout_ms == DEFAULT_BACKEND_TIMEOUT_MS
 
 
 async def _collect(processor: TurnProcessor, message: InboundMessage) -> list[Any]:
@@ -234,7 +238,7 @@ async def test_outbound_record_failure_does_not_break_turn(db_path: Path) -> Non
 
 async def test_error_record_failure_still_returns_error_event(db_path: Path) -> None:
     store = Store(db_path)
-    store.migrate()  # no backend configured -> backend_down path
+    store.migrate()
     original_add_message = store.add_message
 
     def flaky_add(record: Any) -> int:
@@ -242,8 +246,15 @@ async def test_error_record_failure_still_returns_error_event(db_path: Path) -> 
             raise RuntimeError("no history for you")
         return original_add_message(record)
 
+    def down(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
     store.add_message = flaky_add  # type: ignore[method-assign]
-    processor = TurnProcessor(store, BackendRouter(store))
+    processor = TurnProcessor(
+        store,
+        _spec(),
+        http_client_factory=lambda: httpx.AsyncClient(transport=httpx.MockTransport(down)),
+    )
 
     events = await _collect(processor, _message())
 
@@ -261,7 +272,7 @@ async def test_event_publish_failure_does_not_break_turn(db_path: Path) -> None:
 
     processor = TurnProcessor(
         store,
-        BackendRouter(store),
+        _spec(),
         events=BrokenBus(),  # type: ignore[arg-type]
         http_client_factory=lambda: httpx.AsyncClient(
             transport=httpx.MockTransport(

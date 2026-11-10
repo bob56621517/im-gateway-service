@@ -8,7 +8,38 @@
 - **微信 / 企微 / QQ / 钉钉四条链路全部跑通**（扫码登录 → 入站解析 → processor → dev-backend → 自动 ACK 回复 → 主动 `imgw send` 推送 → 聊天记录落库）。
 - **飞书**：扫码建应用成功，但飞书以 `21001 platform policy` 拒绝签发 tenant_access_token；已用官方 `lark-cli` 交叉验证为**平台/租户策略**问题，非本仓库代码；凭据会保留，待账号/应用策略解决后重连。
 - 静默凭据注册：QQ / 钉钉 / 企微 adapter 均已具备，**待真机验证**。
-- 代码门禁全绿：`466 passed`、`ruff`、`mypy`（strict）。
+- 代码门禁全绿：`527 passed`、`ruff`、`mypy`（strict）。
+
+## 0.1 架构简化：后端只保留「一个 URL，POST」（GitHub issue #3）
+
+> 2026-11-10。网关**不再管理后端路由**，删除 multi-tenant/backends 层。
+
+| 项 | 旧 | 新 |
+|---|---|---|
+| 后端寻址 | `backends` 表（tenant → webhook）+ `channels.tenant_id` | 单一 URL：`run --backend-url` > `IMGW_BACKEND_URL` > `http://127.0.0.1:8080` |
+| 契约 | 仅 `POST {url}/v1/turns`（SSE） | 不变；无健康检查 / 探测 / 注册 / 校验 |
+| 鉴权 | `backends.token_ref`（`${ENV}` 展开） | 可选 `IMGW_BACKEND_TOKEN` → `Authorization: Bearer`；未设置则完全不发该头 |
+| 超时 | `backends.timeout_ms` | 可选 `IMGW_BACKEND_TIMEOUT_MS`（默认 120000） |
+| 通道区分 | 按 tenant 路由 | 请求头 `X-Imgw-Channel-Id` / `X-Imgw-Channel-Name` / `X-Imgw-Kind` |
+| schema | v1（含 `backends`、`channels.tenant_id`） | **v2**：迁移删除二者；`Store.migrate()` 自动 v1→v2 |
+| 配置文档 | version 1 含 `backends[]` / `channels[].tenant_id` | **version 2**；v1 文档与残留字段给出明确错误 |
+| CLI | `channel login --tenant`、`status` 的 backends 计数 | **删除 `--tenant`**；`run --backend-url`；`status` 显示只读 `backend_url` |
+| dev 模式 | `BackendRouter(override=...)` 覆盖所有 tenant | `run-dev` 把**全局 backend URL** 指向进程内回显后端 |
+
+保留：`TurnFrame` 信封不动。`ChannelRef.tenant_id` 是 §12.2 冻结 wire 字段，**继续保留但恒为 `""`**（不参与路由）；
+可选 seam：通道 config 里的普通键 `backend_url` 由 `resolve_backend_url()` 解析，默认未暴露到 CLI/help。
+
+## 0.2 登录超时语义统一（task-3）
+
+> 2026-11-10。三个超时不再割裂，`--timeout` 与二维码 TTL 对齐。
+
+| 项 | 旧 | 新 |
+|---|---|---|
+| daemon 登录会话 | 固定 600s TTL | **默认无超时**（`session_ttl_s=None`）；仅 `IMGW_LOGIN_SESSION_TTL` 显式启用 |
+| CLI `--timeout` | 默认 300s，只是等待上限 | 默认 **900s**；平台支持时即二维码有效期（微信 `wait_for_login(timeout_s)`、飞书本地等待取 min） |
+| 平台 TTL | 各 adapter 自理，CLI 无感知 | 钉钉 `expires_in`、飞书 `expireIn` 通过 challenge `expires_in_s` 透出；CLI 钳制等待为 `min(--timeout, TTL+5s)` |
+| 提示 | 无 | 输出二维码后打印**一行**：`用{App}扫描二维码(，二维码有效期 {ttl})，或者在{App}中点击链接：{url}`；TTL 未知不显示有效期；中英双语 |
+| 企微/QQ | — | 平台无 TTL 参数：跟随平台，不编造有效期 |
 
 ## 1. 已完成
 
@@ -44,9 +75,9 @@
 ### 1.3 dev-backend 调试套件 + `run-dev`
 
 - 源码：`src/im_gateway/dev/backend.py`（`create_dev_backend_app()` + `python -m im_gateway.dev.backend`）；
-- `imgw run-dev`：进程内起回显后端（默认 `127.0.0.1:9900`），用 `BackendRouter(override=...)` 接管**所有 tenant**；
-- 不写 `backends` 表，其余机制（messages/subjects/dedup/audit）照旧；
-- 回显一次返回：`channel_id / kind / tenant_id / subject_id / subject_name / chat_type / session_key / turn_id / idempotency_key / message`。
+- `imgw run-dev`：进程内起回显后端（默认 `127.0.0.1:9900`），把**全局 backend URL** 指向它（见 §0.1）；
+- 其余机制（messages/subjects/dedup/audit、token、超时）照旧；
+- 回显一次返回：`channel_id / kind / subject_id / subject_name / chat_type / session_key / turn_id / idempotency_key / message`。
 
 ### 1.4 本轮真实 bug 修复
 
@@ -78,17 +109,17 @@
 
 - 每个平台均出现 `in inbound`（用户发给机器人）+ `out message`（dev-backend ACK）；
 - 主动推送均返回 `sent to <channel>/<subject>` 且平台侧收到；
-- `backends` 表 = **0 行**（证明 `run-dev` 只做内存路由覆盖）。
+- 本轮 run-dev 不再有 `backends` 表（schema v2 已删除）；后端 URL 只来自 flag/env。
 
 ## 3. 测试与门禁
 
 ```text
-uv run pytest -q            466 passed
+uv run pytest -q            527 passed
 uv run ruff check src tests  All checks passed
-uv run mypy                  Success: no issues found (28 source files)
+uv run mypy src              Success: no issues found (29 source files)
 ```
 
-新增测试：`tests/test_dev_backend.py`（SSE 回显/错误帧/token/路由 override）、login 5 平台 adapter、CLI 新命令与输出契约、空 token 头、`chat_type` 默认值、QQ `secret` 映射、钉钉状态机、subjects metadata 序列化等。
+新增/调整测试：schema v1→v2 迁移（backends/tenant_id 消失、数据保留）、processor 单 URL + `X-Imgw-*` 头 + 空 token 省略 Authorization、config v2 拒绝 v1/残留字段、`run --backend-url` 透传、`channel login` 不再接受 `--tenant`、`status` 显示 `backend_url`、i18n en/zh 帮助同步。
 
 ## 4. 未完成 / 下一步
 
@@ -101,7 +132,7 @@ uv run mypy                  Success: no issues found (28 source files)
 ## 5. 如何复现当前验证
 
 ```bash
-# 终端 A：开发模式 daemon（内置回显后端，不写 backends 表）
+# 终端 A：开发模式 daemon（内置回显后端；全局 backend URL 指向它）
 uv run imgw run-dev
 
 # 终端 B：查看状态 / 历史

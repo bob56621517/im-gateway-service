@@ -301,8 +301,28 @@ def test_english_help_is_complete() -> None:
 def test_english_root_help_documents_env_vars_and_exit_codes() -> None:
     root = _root_command(_main_module())
     text = f"{root.help}\n{root.epilog}"
-    for token in ("IMGW_URL", "IMGW_TOKEN", "IMGW_TOKEN_FILE", "IMGW_LANG", "Exit codes", "Quick start"):
+    for token in (
+        "IMGW_URL",
+        "IMGW_TOKEN",
+        "IMGW_TOKEN_FILE",
+        "IMGW_BACKEND_URL",
+        "IMGW_BACKEND_TOKEN",
+        "IMGW_BACKEND_TIMEOUT_MS",
+        "IMGW_LANG",
+        "Exit codes",
+        "Quick start",
+    ):
         assert token in text
+
+
+def test_run_help_documents_backend_url_and_no_tenant() -> None:
+    run = _find(_root_command(_main_module()), "run")
+    text = f"{run.help}\n{run.epilog}"
+    assert "--backend-url" in text
+    assert "IMGW_BACKEND_URL" in text
+    login = _find(_root_command(_main_module()), "channel login")
+    params = {param.name for param in _documented_params(login)}
+    assert "tenant" not in params
 
 
 def test_english_channel_login_help_covers_every_mode_and_platform() -> None:
@@ -378,7 +398,6 @@ def test_chinese_help_representative_samples(zh_cli_module: Any) -> None:
     assert zh_cli_module.CHANNEL_TABLE_HEADERS == [
         "CHANNEL_ID",
         "KIND",
-        "TENANT",
         "ALIAS",
         "ENABLED",
         "STATE",

@@ -47,9 +47,11 @@ class FakeAdapter:
         self.started = 0
         self.cancelled = 0
         self.raise_on_start: Exception | None = None
+        self.start_timeouts: list[float | None] = []
 
-    async def start(self) -> LoginChallenge:
+    async def start(self, *, timeout_s: float | None = None) -> LoginChallenge:
         self.started += 1
+        self.start_timeouts.append(timeout_s)
         if self.raise_on_start is not None:
             raise self.raise_on_start
         return self.challenge
@@ -96,7 +98,6 @@ def add_channel(
         ChannelRecord(
             channel_id=channel_id,
             kind=kind,
-            tenant_id="acme",
             alias=alias,
             name="Sales",
             config=dict(config or {}),
@@ -286,6 +287,29 @@ async def test_poll_expired_and_ttl_expiry(db_path: Path) -> None:
     assert manager.sessions == {}
 
 
+async def test_default_login_session_has_no_daemon_ttl(db_path: Path) -> None:
+    """A pending login session lives until the platform QR or CLI timeout says otherwise."""
+    store = Store(db_path)
+    store.migrate()
+    add_channel(store)
+    adapter = FakeAdapter(challenge=LoginChallenge(qr_content="x", expires_in_s=90))
+    clock = [0.0]
+    manager = LoginManager(
+        FakeRuntime(store),  # type: ignore[arg-type]
+        adapter_factory=lambda kind: adapter,
+        clock=lambda: clock[0],
+    )
+
+    view = await manager.begin("sales", timeout_s=120)
+    assert adapter.start_timeouts == [120]
+    assert view["expires_in_s"] == 90
+    assert view["status"] == "pending"
+
+    clock[0] = 10_000.0  # way past any old 600s default
+    still_pending = await manager.poll("sales", str(view["session_id"]))
+    assert still_pending["status"] == "pending"
+
+
 async def test_poll_and_cancel_scope_to_channel(db_path: Path) -> None:
     store = Store(db_path)
     store.migrate()
@@ -389,7 +413,8 @@ class FakeWeixinLogin:
     async def fetch_qr_code(self) -> Any:
         return type("QR", (), {"qrcode": "qrcode-token", "qrcode_img_content": "https://qr/img"})()
 
-    async def wait_for_login(self, qrcode: str, on_scanned: Any = None) -> Any:
+    async def wait_for_login(self, qrcode: str, on_scanned: Any = None, **kwargs: Any) -> Any:
+        self.wait_timeout_s = kwargs.get("timeout_s")
         if on_scanned is not None:
             on_scanned()
             self.scanned = True
@@ -415,9 +440,10 @@ async def test_weixin_adapter_polls_scanned_then_confirmed() -> None:
     login.gate = asyncio.Event()
     adapter = WeixinLoginAdapter(login=login)
 
-    challenge = await adapter.start()
+    challenge = await adapter.start(timeout_s=123.0)
     assert challenge.qr_image_url == "https://qr/img"
     await asyncio.sleep(0)
+    assert login.wait_timeout_s == 123.0  # --timeout is forwarded to wait_for_login
     assert (await adapter.poll()).status == "scanned"
 
     login.gate.set()
@@ -521,6 +547,7 @@ async def test_feishu_adapter_start_and_success() -> None:
 
     challenge = await adapter.start()
     assert challenge.qr_content == "https://accounts.feishu.cn/qr/abc"
+    assert challenge.expires_in_s == 600  # SDK-reported ``expire_in`` is surfaced
 
     assert len(register.calls) == 1
     kwargs = register.calls[0]
@@ -732,6 +759,7 @@ async def test_dingtalk_adapter_happy_path() -> None:
 
     challenge = await adapter.start()
     assert challenge.qr_content == "https://oapi.dingtalk.com/qr/abc"
+    assert challenge.expires_in_s == 60  # platform-reported ``expires_in``
     assert post.calls[0] == ("/app/registration/init", {})
     assert post.calls[1] == ("/app/registration/begin", {"nonce": "nonce-1"})
 
@@ -869,7 +897,6 @@ def login_app(db_path: Path) -> Iterator[tuple[TestClient, LoginManager, FakeAda
             ChannelRecord(
                 channel_id=CHANNEL_ID,
                 kind="qq",
-                tenant_id="acme",
                 alias="sales",
                 name="Sales",
                 config={},
@@ -883,7 +910,6 @@ def login_app(db_path: Path) -> Iterator[tuple[TestClient, LoginManager, FakeAda
             ChannelRecord(
                 channel_id="telegram:acme:1",
                 kind="telegram",
-                tenant_id="acme",
                 alias="tg",
                 name="Telegram",
                 config={},
@@ -897,7 +923,6 @@ def login_app(db_path: Path) -> Iterator[tuple[TestClient, LoginManager, FakeAda
             ChannelRecord(
                 channel_id="qq:acme:other",
                 kind="qq",
-                tenant_id="acme",
                 alias="other",
                 name="Other",
                 config={},
@@ -913,9 +938,21 @@ def login_app(db_path: Path) -> Iterator[tuple[TestClient, LoginManager, FakeAda
 def test_api_login_flow_persists_credentials(db_path: Path) -> None:
     with login_app(db_path) as (client, login_manager, adapter):
         auth = {"Authorization": f"Bearer {TOKEN}"}
-        begin = client.post("/v1/channels/sales/login", headers=auth)
+        begin = client.post("/v1/channels/sales/login", json={"timeout_s": 120}, headers=auth)
         assert begin.status_code == 200, begin.text
         session_id = begin.json()["session_id"]
+        assert adapter.start_timeouts == [120.0]  # CLI budget reaches the adapter
+
+        assert (
+            client.post("/v1/channels/sales/login", json={"timeout_s": 0}, headers=auth).status_code
+            == 422
+        )
+        assert (
+            client.post(
+                "/v1/channels/sales/login", json={"timeout_s": 1, "bogus": True}, headers=auth
+            ).status_code
+            == 422
+        )
 
         adapter.poll_results = [
             LoginPoll("success", config_updates={"app_id": "app_1", "app_secret": "sec_1"})

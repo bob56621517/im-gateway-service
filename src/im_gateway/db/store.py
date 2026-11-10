@@ -3,7 +3,7 @@
 Design constraints from the handover:
 
 - **SQLite is the single source of truth** for both declarative config
-  (``channels`` / ``backends`` / ``settings``) and runtime data
+  (``channels`` / ``settings``) and runtime data
   (``messages`` / ``turn_events`` / ``subjects`` / ``inbound_dedup`` /
   ``audit`` / ``schema_migrations``).
 - **One writer** (the daemon) in steady state; the offline CLI takes a
@@ -33,7 +33,6 @@ from typing import Any, Final
 
 from im_gateway.db.models import (
     DIRECTIONS,
-    BackendRecord,
     ChannelRecord,
     MessageRecord,
     SubjectRecord,
@@ -52,7 +51,7 @@ PRUNE_BATCH_SIZE: Final[int] = 5000
 
 #: Whitelist for :meth:`Store.update_channel` (public names, not column names).
 CHANNEL_UPDATE_FIELDS: Final[frozenset[str]] = frozenset(
-    {"kind", "tenant_id", "alias", "name", "config", "constraints", "enabled"}
+    {"kind", "alias", "name", "config", "constraints", "enabled"}
 )
 
 #: Tables reported by :meth:`Store.table_counts` and :meth:`Store.prune`.
@@ -60,7 +59,6 @@ TABLES: Final[tuple[str, ...]] = (
     "schema_migrations",
     "settings",
     "channels",
-    "backends",
     "subjects",
     "inbound_dedup",
     "audit",
@@ -73,7 +71,6 @@ _SECONDS_PER_DAY: Final[float] = 86_400.0
 # public record field name -> SQLite column name
 _CHANNEL_COLUMNS: Final[dict[str, str]] = {
     "kind": "kind",
-    "tenant_id": "tenant_id",
     "alias": "alias",
     "name": "name",
     "config": "config_json",
@@ -100,7 +97,6 @@ def _channel_from_row(row: sqlite3.Row) -> ChannelRecord:
     return ChannelRecord(
         channel_id=row["channel_id"],
         kind=row["kind"],
-        tenant_id=row["tenant_id"],
         alias=row["alias"],
         name=row["name"],
         config=_loads(row["config_json"]),
@@ -109,18 +105,6 @@ def _channel_from_row(row: sqlite3.Row) -> ChannelRecord:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         last_started_at=row["last_started_at"],
-    )
-
-
-def _backend_from_row(row: sqlite3.Row) -> BackendRecord:
-    return BackendRecord(
-        tenant_id=row["tenant_id"],
-        base_url=row["base_url"],
-        token_ref=row["token_ref"],
-        timeout_ms=row["timeout_ms"],
-        enabled=bool(row["enabled"]),
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
     )
 
 
@@ -321,15 +305,14 @@ class Store:
                 conn.execute(
                     """
                     INSERT INTO channels(
-                      channel_id, kind, tenant_id, alias, name,
+                      channel_id, kind, alias, name,
                       config_json, constraints_json, enabled,
                       created_at, updated_at, last_started_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record.channel_id,
                         record.kind,
-                        record.tenant_id,
                         record.alias,
                         record.name,
                         _dumps(record.config),
@@ -421,49 +404,6 @@ class Store:
                 "UPDATE channels SET last_started_at = ? WHERE channel_id = ?",
                 (ts, channel_id),
             )
-
-    # -- backends --------------------------------------------------------------
-
-    def list_backends(self) -> list[BackendRecord]:
-        with self._connect() as conn:
-            rows = conn.execute("SELECT * FROM backends ORDER BY tenant_id").fetchall()
-        return [_backend_from_row(row) for row in rows]
-
-    def get_backend(self, tenant_id: str) -> BackendRecord | None:
-        with self._connect() as conn:
-            row = conn.execute("SELECT * FROM backends WHERE tenant_id = ?", (tenant_id,)).fetchone()
-        return None if row is None else _backend_from_row(row)
-
-    def upsert_backend(self, record: BackendRecord) -> None:
-        """Insert or update by ``tenant_id``; the original ``created_at`` is kept."""
-        with self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO backends(
-                  tenant_id, base_url, token_ref, timeout_ms, enabled, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(tenant_id) DO UPDATE SET
-                  base_url = excluded.base_url,
-                  token_ref = excluded.token_ref,
-                  timeout_ms = excluded.timeout_ms,
-                  enabled = excluded.enabled,
-                  updated_at = excluded.updated_at
-                """,
-                (
-                    record.tenant_id,
-                    record.base_url,
-                    record.token_ref,
-                    record.timeout_ms,
-                    int(record.enabled),
-                    record.created_at,
-                    record.updated_at,
-                ),
-            )
-
-    def delete_backend(self, tenant_id: str) -> bool:
-        with self._connect() as conn:
-            cursor = conn.execute("DELETE FROM backends WHERE tenant_id = ?", (tenant_id,))
-        return cursor.rowcount > 0
 
     # -- subjects --------------------------------------------------------------
 
@@ -695,7 +635,7 @@ class Store:
             conn.execute("VACUUM INTO ?", (str(target),))
 
     def table_counts(self) -> dict[str, int]:
-        """Row count for every table in schema v1."""
+        """Row count for every table in the current schema."""
         counts: dict[str, int] = {}
         with self._connect() as conn:
             for table in TABLES:

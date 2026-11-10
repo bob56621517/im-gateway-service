@@ -164,6 +164,13 @@ TERMINAL_KINDS: frozenset[FrameKind] = frozenset({FrameKind.ERROR, FrameKind.COM
 
 
 class ChannelRef(BaseModel):
+    """Channel identity on the wire (frozen contract, HANDOVER §12.2).
+
+    ``tenant_id`` is kept for wire compatibility with version-1 backends, but
+    the gateway no longer has tenants (GitHub issue #3): it is **always the
+    empty string**. Do not use it for routing.
+    """
+
     channel_id: str
     kind: str
     tenant_id: str | None = None
@@ -398,7 +405,10 @@ def start_from_inbound(
         channel=ChannelRef(
             channel_id=message.channel_id,
             kind=message.channel_type or "unknown",
-            tenant_id=message.tenant_id,
+            # Frozen wire field (HANDOVER §12.2); the gateway has no tenants, so
+            # this is always empty. ``InboundMessage.tenant_id`` is deliberately
+            # ignored (HANDOVER §16).
+            tenant_id="",
         ),
         subject=SubjectRef(
             subject_id=subject.subject_id,

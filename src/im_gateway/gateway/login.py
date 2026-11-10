@@ -59,8 +59,11 @@ logger = logging.getLogger(__name__)
 
 #: Channel kinds that have a QR binding flow.
 SUPPORTED_LOGIN_KINDS: frozenset[str] = frozenset({"qq", "weixin", "feishu", "wecom", "dingtalk"})
-#: Default lifetime of a pending login session.
-DEFAULT_SESSION_TTL_S: float = 600.0
+#: Default daemon-side lifetime of a pending login session.  ``None`` means the
+#: session itself never expires: the platform QR TTL (and the CLI ``--timeout``)
+#: bound how long a user can take to scan.  Override with
+#: ``IMGW_LOGIN_SESSION_TTL`` for deployments that want a hard cap.
+DEFAULT_SESSION_TTL_S: Final[float | None] = None
 
 LoginStatus = Literal["pending", "scanned", "success", "expired"]
 
@@ -71,6 +74,10 @@ class LoginChallenge:
 
     qr_content: str = ""  # text to encode as a QR code (QQ)
     qr_image_url: str = ""  # URL of a QR image (Weixin)
+    #: Platform-reported QR validity in seconds, when the platform tells us
+    #: (DingTalk ``expires_in`` / Feishu ``expireIn``).  ``None`` means unknown:
+    #: callers must not invent a validity hint.
+    expires_in_s: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,9 +90,14 @@ class LoginPoll:
 
 
 class LoginAdapter(Protocol):
-    """Minimal interface over an upstream two-phase QR helper."""
+    """Minimal interface over an upstream two-phase QR helper.
 
-    async def start(self) -> LoginChallenge: ...
+    ``timeout_s`` is the caller's overall wait budget (from ``--timeout``,
+    default 900s).  Adapters whose platform supports a wait/QR timeout pass it
+    through; the rest ignore it and follow the platform's own TTL.
+    """
+
+    async def start(self, *, timeout_s: float | None = None) -> LoginChallenge: ...
 
     async def poll(self) -> LoginPoll: ...
 
@@ -104,13 +116,15 @@ class QQLoginAdapter:
         self._login = login
         self._task_id: str = ""
 
-    async def start(self) -> LoginChallenge:
+    async def start(self, *, timeout_s: float | None = None) -> LoginChallenge:
         if self._login is None:
             from octop_gateway.channels.qq.login_qr import QQBotQRLogin
 
             self._login = QQBotQRLogin()
         response = await self._login.fetch_qr_code()
         self._task_id = str(response.task_id)
+        # QQ does not publish the QR TTL in the fetch response: the platform's
+        # poll reports expiry itself, so there is no validity to display.
         return LoginChallenge(qr_content=str(response.qrcode_url))
 
     async def poll(self) -> LoginPoll:
@@ -155,12 +169,15 @@ class WeixinLoginAdapter:
         self._task: asyncio.Task[None] | None = None
         self._scanned = False
         self._result: LoginPoll | None = None
+        #: Overall wait budget; passed to ``wait_for_login`` (upstream default 480s).
+        self._wait_timeout_s: float | None = None
 
-    async def start(self) -> LoginChallenge:
+    async def start(self, *, timeout_s: float | None = None) -> LoginChallenge:
         if self._login is None:
             from octop_gateway.channels.weixin.login_qr import WeixinQRLogin
 
             self._login = WeixinQRLogin()
+        self._wait_timeout_s = timeout_s
         response = await self._login.fetch_qr_code()
         self._qrcode = str(response.qrcode)
         self._task = asyncio.create_task(self._wait_for_login(), name="imgw-weixin-login")
@@ -171,7 +188,14 @@ class WeixinLoginAdapter:
             self._result = LoginPoll("expired", message="登录尚未初始化")
             return
         try:
-            result = await self._login.wait_for_login(self._qrcode, on_scanned=self._on_scanned)
+            if self._wait_timeout_s is None:
+                result = await self._login.wait_for_login(self._qrcode, on_scanned=self._on_scanned)
+            else:
+                result = await self._login.wait_for_login(
+                    self._qrcode,
+                    on_scanned=self._on_scanned,
+                    timeout_s=self._wait_timeout_s,
+                )
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # adapter/network failure -> expired with reason
@@ -296,14 +320,20 @@ class FeishuLoginAdapter:
         self._qr_ready = threading.Event()
         self._done = threading.Event()
         self._qr_payload: dict[str, Any] = {}
+        self._qr_expires_in_s: float | None = None
         self._result: dict[str, Any] | None = None
         self._error: BaseException | None = None
         self._error_message = ""
         self._thread: threading.Thread | None = None
 
-    async def start(self) -> LoginChallenge:
+    async def start(self, *, timeout_s: float | None = None) -> LoginChallenge:
         if self._thread is not None:
             raise RuntimeError("飞书扫码登录已在进行中，请先取消")
+        # ``qr_wait_s`` bounds how long we wait for the SDK to *produce* the QR
+        # URL; the QR itself stays valid for the platform's own TTL (Feishu
+        # reports it as ``expireIn``, surfaced below), so ``--timeout`` only
+        # shortens our local wait when it is smaller.
+        wait_s = self._qr_wait_s if timeout_s is None else min(self._qr_wait_s, timeout_s)
         if self._register is None:
             # Cold ``import lark_oapi`` is slow (tens of seconds); warm it before
             # the QR wait starts so the first scan does not spuriously time out.
@@ -318,7 +348,7 @@ class FeishuLoginAdapter:
         )
         self._thread.start()
 
-        deadline = time.monotonic() + self._qr_wait_s
+        deadline = time.monotonic() + wait_s
         while not self._qr_ready.is_set():
             if self._done.is_set():
                 message = self._error_message or "飞书扫码登录线程提前结束"
@@ -328,12 +358,12 @@ class FeishuLoginAdapter:
                 break
             await asyncio.sleep(min(0.05, remaining))
         if not self._qr_ready.is_set():
-            raise RuntimeError(f"等待飞书二维码超时（{self._qr_wait_s:g}s），请重新发起")
+            raise RuntimeError(f"等待飞书二维码超时（{wait_s:g}s），请重新发起")
 
         url = str(self._qr_payload.get("url") or "")
         if not url:
             raise RuntimeError("飞书扫码登录未返回二维码地址")
-        return LoginChallenge(qr_content=url)
+        return LoginChallenge(qr_content=url, expires_in_s=self._qr_expires_in_s)
 
     def _run_register(self) -> None:
         register = self._register or _feishu_default_register
@@ -356,6 +386,12 @@ class FeishuLoginAdapter:
 
     def _on_qr_code(self, info: dict[str, Any]) -> None:
         self._qr_payload = dict(info) if isinstance(info, dict) else {}
+        raw_expiry = self._qr_payload.get("expire_in") or self._qr_payload.get("expireIn")
+        try:
+            value = float(raw_expiry) if raw_expiry is not None else 0.0
+        except (TypeError, ValueError):
+            value = 0.0
+        self._qr_expires_in_s = value if value > 0 else None
         self._qr_ready.set()
 
     async def poll(self) -> LoginPoll:
@@ -453,7 +489,9 @@ class WeComLoginAdapter:
         self._source = source
         self._scode = ""
 
-    async def start(self) -> LoginChallenge:
+    async def start(self, *, timeout_s: float | None = None) -> LoginChallenge:
+        # WeCom's QR endpoint exposes neither a TTL parameter nor a TTL value:
+        # follow the platform and show no validity hint.
         generate = self._generate or _wecom_default_generate
         data = await generate(self._source)
         scode = str(data.get("scode") or "")
@@ -548,7 +586,9 @@ class DingTalkLoginAdapter:
         self._expires_at: float | None = None
         self._last_status = ""
 
-    async def start(self) -> LoginChallenge:
+    async def start(self, *, timeout_s: float | None = None) -> LoginChallenge:
+        # DingTalk decides the QR TTL itself (``begin`` returns ``expires_in``);
+        # pass it back so the CLI can tell the user the real validity.
         post = self._post or _dingtalk_default_post
         init = await post("/app/registration/init", {})
         nonce = str(init.get("nonce") or "")
@@ -562,7 +602,10 @@ class DingTalkLoginAdapter:
         self._device_code = device_code
         expires_in = _positive_float(begin.get("expires_in"))
         self._expires_at = self._clock() + expires_in if expires_in else None
-        return LoginChallenge(qr_content=qr_url)
+        return LoginChallenge(
+            qr_content=qr_url,
+            expires_in_s=expires_in if expires_in else None,
+        )
 
     async def poll(self) -> LoginPoll:
         if not self._device_code:
@@ -670,13 +713,13 @@ class LoginManager:
         *,
         adapter_factory: Callable[[str], LoginAdapter] | None = None,
         clock: Callable[[], float] = time.time,
-        session_ttl_s: float = DEFAULT_SESSION_TTL_S,
+        session_ttl_s: float | None = DEFAULT_SESSION_TTL_S,
         actor: str = "api-token",
     ) -> None:
         self._runtime = runtime
         self._adapter_factory = adapter_factory or default_adapter_factory
         self._clock = clock
-        self._session_ttl_s = max(1.0, float(session_ttl_s))
+        self._session_ttl_s = None if session_ttl_s is None else max(1.0, float(session_ttl_s))
         self._actor = actor
         self._sessions: dict[str, _LoginSession] = {}
 
@@ -685,15 +728,20 @@ class LoginManager:
         """Read-only view for diagnostics/tests."""
         return dict(self._sessions)
 
-    async def begin(self, ref: str) -> dict[str, Any]:
-        """Start a login session and return the QR challenge."""
+    async def begin(self, ref: str, *, timeout_s: float | None = None) -> dict[str, Any]:
+        """Start a login session and return the QR challenge.
+
+        ``timeout_s`` is the caller's overall wait budget (CLI ``--timeout``);
+        adapters whose platform has a matching knob receive it, others follow
+        the platform TTL.  The daemon session itself has no expiry by default.
+        """
         record = self._require_channel(ref)
         if record.kind not in SUPPORTED_LOGIN_KINDS:
             raise ValueError(f"通道类型不支持扫码登录: {record.kind!r}")
 
         adapter = self._adapter_factory(record.kind)
         try:
-            challenge = await adapter.start()
+            challenge = await adapter.start(timeout_s=timeout_s)
         except Exception as exc:  # surface a readable 400 instead of a 500
             with contextlib.suppress(Exception):
                 await adapter.cancel()
@@ -715,7 +763,7 @@ class LoginManager:
             "status": "pending",
             "qr_content": challenge.qr_content,
             "qr_image_url": challenge.qr_image_url,
-            "expires_in_s": self._session_ttl_s,
+            "expires_in_s": challenge.expires_in_s,
         }
 
     async def poll(self, ref: str, session_id: str) -> dict[str, Any]:
@@ -723,7 +771,10 @@ class LoginManager:
         record = self._require_channel(ref)
         session = self._require_session(record.channel_id, session_id)
 
-        if self._clock() - session.created_at > self._session_ttl_s:
+        if (
+            self._session_ttl_s is not None
+            and self._clock() - session.created_at > self._session_ttl_s
+        ):
             await self._drop(session, cancel=True)
             return self._view(session, "expired", "登录会话已超时，请重新发起")
 

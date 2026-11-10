@@ -111,6 +111,7 @@ _ZH_CATALOG: Final[dict[str, str]] = {
         '\n'
         '\b\n'
         '$ imgw run                                 # terminal 1: start the daemon\n'
+        '$ imgw run --backend-url http://127.0.0.1:8080   # ...with an explicit backend\n'
         '$ imgw status                              # terminal 2: daemon + channel state\n'
         '$ imgw channel login feishu --name sales   # QR-code bind (5 platforms)\n'
         '$ imgw channel list                        # TSV: channel_id kind state creds alias\n'
@@ -129,6 +130,9 @@ _ZH_CATALOG: Final[dict[str, str]] = {
         'IMGW_URL         control-plane URL (http(s)://host:port or unix:///path/to.sock)\n'
         'IMGW_TOKEN       control-plane bearer token\n'
         'IMGW_TOKEN_FILE  file holding the bearer token (created by `imgw run`)\n'
+        'IMGW_BACKEND_URL       agent backend base URL (default http://127.0.0.1:8080)\n'
+        'IMGW_BACKEND_TOKEN     optional bearer token sent to the backend\n'
+        'IMGW_BACKEND_TIMEOUT_MS  backend turn timeout in milliseconds (default 120000)\n'
         'IMGW_LANG        help/error language: en (default) or zh (zh_CN, zh-TW, GBK/936)\n'
         '\n'
         'Exit codes:\n'
@@ -152,6 +156,7 @@ _ZH_CATALOG: Final[dict[str, str]] = {
         '\n'
         '\b\n'
         '$ imgw run                                 # 终端 1：启动守护进程\n'
+        '$ imgw run --backend-url http://127.0.0.1:8080   # ……显式指定后端\n'
         '$ imgw status                              # 终端 2：守护进程与通道状态\n'
         '$ imgw channel login feishu --name sales   # 扫码绑定（支持 5 个平台）\n'
         '$ imgw channel list                        # TSV：channel_id kind state creds alias\n'
@@ -170,6 +175,9 @@ _ZH_CATALOG: Final[dict[str, str]] = {
         'IMGW_URL         控制面 URL（http(s)://host:port 或 unix:///path/to/sock）\n'
         'IMGW_TOKEN       控制面 bearer token\n'
         'IMGW_TOKEN_FILE  保存 bearer token 的文件（由 `imgw run` 创建）\n'
+        'IMGW_BACKEND_URL       后端基础 URL（默认 http://127.0.0.1:8080）\n'
+        'IMGW_BACKEND_TOKEN     可选：发送给后端的 bearer token\n'
+        'IMGW_BACKEND_TIMEOUT_MS  后端 turn 超时毫秒数（默认 120000）\n'
         'IMGW_LANG        帮助/错误语言：en（默认）或 zh（接受 zh_CN、zh-TW、GBK/936）\n'
         '\n'
         '退出码：\n'
@@ -348,10 +356,10 @@ _ZH_CATALOG: Final[dict[str, str]] = {
     # main.py:564
     (
         'Show daemon status: service and octop-gateway versions, uptime, database and media '
-        'paths, backend and channel counters, and per-channel state (`GET /v1/status`).'
+        'paths, the effective backend URL, and per-channel state (`GET /v1/status`).'
     ): (
         '查看守护进程状态：服务与 octop-gateway '
-        '版本、运行时长、数据库与媒体路径、后端与通道计数，以及每个通道的状态（`GET '
+        '版本、运行时长、数据库与媒体路径、生效的后端 URL，以及每个通道的状态（`GET '
         '/v1/status`）。'
     ),
     # main.py:569
@@ -571,13 +579,15 @@ _ZH_CATALOG: Final[dict[str, str]] = {
         'Start the gateway daemon in the foreground (the production entry point). This is the '
         'only command that starts a process: it migrates and opens the SQLite database, '
         'reconciles enabled channels from the database, and serves the control plane plus all '
-        'channel connections in one asyncio loop. Stop it with Ctrl-C; for a managed service use '
-        '`imgw install-service` followed by `imgw start`.'
+        'channel connections in one asyncio loop. Every inbound turn is POSTed to one backend '
+        'URL: `--backend-url`, then `$IMGW_BACKEND_URL`, then `http://127.0.0.1:8080`. Stop it '
+        'with Ctrl-C; for a managed service use `imgw install-service` followed by `imgw start`.'
     ): (
         '在前台启动网关守护进程（生产入口）。这是唯一会启动进程的命令：它会迁移并打开 SQLite '
         '数据库，从数据库恢复已启用的通道，并在同一个 asyncio '
-        '事件循环里提供控制面与全部通道连接。用 Ctrl-C 停止；作为系统服务托管请先用 `imgw '
-        'install-service` 安装，再执行 `imgw start`。'
+        '事件循环里提供控制面与全部通道连接。所有入站 turn 都 POST 到唯一后端 URL：'
+        '`--backend-url`，其次 `$IMGW_BACKEND_URL`，最后 `http://127.0.0.1:8080`。用 Ctrl-C '
+        '停止；作为系统服务托管请先用 `imgw install-service` 安装，再执行 `imgw start`。'
     ),
     # main.py:922
     (
@@ -585,6 +595,7 @@ _ZH_CATALOG: Final[dict[str, str]] = {
         '\n'
         '\b\n'
         '$ imgw run\n'
+        '$ imgw run --backend-url http://127.0.0.1:8080\n'
         '$ imgw run --host 127.0.0.1 --port 8765\n'
         ''
     ): (
@@ -592,29 +603,39 @@ _ZH_CATALOG: Final[dict[str, str]] = {
         '\n'
         '\b\n'
         '$ imgw run\n'
+        '$ imgw run --backend-url http://127.0.0.1:8080\n'
         '$ imgw run --host 127.0.0.1 --port 8765\n'
         ''
     ),
     # main.py:929
     'Start the gateway daemon (production).': '启动网关守护进程（生产入口）。',
+    # main.py:936
+    (
+        'Agent backend base URL; every turn is POSTed to `{url}/v1/turns` (default: '
+        '$IMGW_BACKEND_URL, then http://127.0.0.1:8080).'
+    ): (
+        'agent 后端基础 URL；每个 turn 都会 POST 到 `{url}/v1/turns`（默认取 '
+        '$IMGW_BACKEND_URL，其次 http://127.0.0.1:8080）。'
+    ),
     # main.py:968
     'Loopback port for the in-process echo backend.': '进程内回显后端的回环端口。',
     # main.py:942
     (
         'Start the daemon in development mode. On top of a normal run, an in-process echo backend'
         ' '
-        '(`im_gateway.dev.backend`) listens on `--dev-backend-port` and every tenant is routed to'
+        '(`im_gateway.dev.backend`) listens on `--dev-backend-port`, and the global backend URL is'
         ' '
-        'it; the `backends` table is not modified. The echo backend replies to any inbound '
-        'message with one `message` frame and one `completed` frame listing channel, subject, '
-        'turn and idempotency ids, so channel connectivity can be verified without a real '
-        'webhook.'
+        'pointed at it (all other mechanisms — token, timeout, history, dedup — are unchanged).'
+        ' '
+        'The echo backend replies to any inbound message with one `message` frame and one '
+        '`completed` frame listing channel, subject, turn and idempotency ids, so channel '
+        'connectivity can be verified without a real backend.'
     ): (
-        '以开发模式启动守护进程。在普通运行的基础上，进程内回显后端（`im_gateway.dev.backend`）监'
-        '听 '
-        '`--dev-backend-port`，所有 tenant 都路由到它；不会修改 `backends` '
-        '表。回显后端对任意入站消息回复一个 `message` 帧和一个 `completed` 帧，内容包含 '
-        'channel、subject、turn 与 idempotency id，因此无需真实 webhook 即可验证通道连通性。'
+        '以开发模式启动守护进程。在普通运行的基础上，进程内回显后端（`im_gateway.dev.backend`）'
+        '监听 '
+        '`--dev-backend-port`，并把全局后端 URL 指向它（token、超时、历史、去重等其他机制均不'
+        '变）。回显后端对任意入站消息回复一个 `message` 帧和一个 `completed` 帧，内容包含 '
+        'channel、subject、turn 与 idempotency id，因此无需真实后端即可验证通道连通性。'
     ),
     # main.py:951
     (
@@ -865,8 +886,6 @@ _ZH_CATALOG: Final[dict[str, str]] = {
     # main.py:1645
     'Instance name for a new channel (also used as the CLI alias).': '新通道的实例名（同时用作 CLI alias）。',
     # main.py:1650
-    'Tenant id (backend routing key) for a new channel.': '新通道的 tenant id（后端路由键）。',
-    # main.py:1656
     (
         'Extra channel config as KEY=VALUE; repeatable (values are typed as bool/int/string).'
     ): (
@@ -911,7 +930,32 @@ _ZH_CATALOG: Final[dict[str, str]] = {
     # main.py:1707
     'Also write the QR code to this PNG path.': '同时把二维码写入该 PNG 路径。',
     # main.py:1711
-    'Overall wait for login confirmation (seconds).': '等待登录确认的总时长（秒）。',
+    (
+        'Overall login wait in seconds (default 15 minutes).  Also the QR validity '
+        'where the platform honours it; platforms with their own TTL report it and '
+        'the wait is clamped to that value.'
+    ): (
+        '登录等待总时长（秒，默认 15 分钟）。平台支持时也作为二维码有效期；'
+        '平台自带 TTL 时会回传，等待时长会被限制在其范围内。'
+    ),
+    # main.py: login hint (app / validity / fallback link)
+    'Scan the QR code with {app}, or open this link in {app}: {url}': (
+        '用{app}扫描二维码，或者在{app}中点击链接：{url}'
+    ),
+    'Scan the QR code with {app} (valid for {ttl}), or open this link in {app}: {url}': (
+        '用{app}扫描二维码，二维码有效期 {ttl}，或者在{app}中点击链接：{url}'
+    ),
+    '{value} seconds': '{value} 秒',
+    '{value} minutes': '{value} 分钟',
+    '1 second': '1 秒',
+    '1 minute': '1 分钟',
+    '{minutes} minutes {seconds} seconds': '{minutes} 分 {seconds} 秒',
+    'this app': '对应的 App',
+    'WeChat': '微信',
+    'WeCom': '企业微信',
+    'DingTalk': '钉钉',
+    'Feishu': '飞书',
+    'QQ': '手机QQ',
     # main.py:1715
     'Poll interval while waiting for confirmation (seconds).': '等待确认时的轮询间隔（秒）。',
     # main.py:1721
@@ -1335,9 +1379,9 @@ _ZH_CATALOG: Final[dict[str, str]] = {
     'Config document to validate.': '要校验的配置文档。',
     # main.py:2309
     (
-        'config OK: {channels} channel(s), {backends} backend(s), {settings} setting(s)'
+        'config OK: {channels} channel(s), {settings} setting(s)'
     ): (
-        'config OK：{channels} 个通道、{backends} 个后端、{settings} 项设置'
+        'config OK：{channels} 个通道、{settings} 项设置'
     ),
     # main.py:2279
     (

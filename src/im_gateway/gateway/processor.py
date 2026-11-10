@@ -9,9 +9,15 @@ One turn is::
     InboundMessage
       -> claim idempotency key              (inbound_dedup, §13.2)
       -> persist inbound + upsert subject   (§13.9 / §11.2 #11)
-      -> POST TurnFrame(kind=start) to the tenant backend's /v1/turns
+      -> POST TurnFrame(kind=start) to the single backend's /v1/turns
       -> translate the SSE frame stream into MessageEvent objects
       -> exactly one terminal event (completed / error)
+
+The backend is **one URL**, resolved from ``--backend-url`` >
+``IMGW_BACKEND_URL`` > ``http://127.0.0.1:8080`` (GitHub issue #3). There is no
+health check, probe, registration or per-tenant routing. Every request carries
+reverse-proxy distribution headers (``X-Imgw-Channel-Id`` / ``-Name`` /
+``X-Imgw-Kind``) so a backend can tell channels apart.
 
 Error policy (HANDOVER §11.2 #2): the upstream swallows processor exceptions and
 sends a fixed English string, so *every* failure is converted into an in-band
@@ -33,7 +39,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Mapping
@@ -54,17 +59,20 @@ from im_gateway.core.contracts import (
     jsonable_metadata,
     start_from_inbound,
 )
-from im_gateway.db.models import MessageRecord, SubjectRecord
+from im_gateway.db.models import ChannelRecord, MessageRecord, SubjectRecord
 from im_gateway.db.store import Store
 from im_gateway.gateway.events import EventBus
 from im_gateway.gateway.idempotency import build_idempotency_key, extract_platform_message_id
 
 __all__ = [
+    "DEFAULT_BACKEND_TIMEOUT_MS",
+    "DEFAULT_BACKEND_URL",
     "DEFAULT_ERROR_TEXTS",
-    "BackendRouter",
     "BackendSpec",
     "TurnProcessor",
     "build_processor",
+    "resolve_backend_spec",
+    "resolve_backend_url",
 ]
 
 logger = logging.getLogger(__name__)
@@ -87,10 +95,12 @@ _UNEXPECTED_START: Final[str] = "后端返回了不应出现的 start 帧"
 
 _TURNS_PATH: Final[str] = "/v1/turns"
 
-#: ``token_ref`` is either an env reference (``${VAR}`` / ``$VAR``) or a literal.
-_ENV_REF_PATTERN: Final[re.Pattern[str]] = re.compile(
-    r"^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))$"
-)
+#: Default backend used when neither ``--backend-url`` nor ``IMGW_BACKEND_URL``
+#: is set. There is no health check or registration: the URL is trusted.
+DEFAULT_BACKEND_URL: Final[str] = "http://127.0.0.1:8080"
+
+#: Default turn deadline (``IMGW_BACKEND_TIMEOUT_MS`` overrides it).
+DEFAULT_BACKEND_TIMEOUT_MS: Final[int] = 120_000
 
 #: Metadata keys that stay durable even if upstream adds them to
 #: ``EPHEMERAL_PUSH_META`` (the iLink context token has a durable copy by design,
@@ -99,8 +109,10 @@ _DURABLE_META_KEYS: Final[frozenset[str]] = frozenset(
     {"weixin_context_token", "weixin_context_token_ms"}
 )
 
-#: Fallback deadline used when neither the backend row nor settings define one.
-_FALLBACK_DEADLINE_MS: Final[int] = 120_000
+#: Distribution headers let one backend tell channels apart (reverse-proxy style).
+_HEADER_CHANNEL_ID: Final[str] = "X-Imgw-Channel-Id"
+_HEADER_CHANNEL_NAME: Final[str] = "X-Imgw-Channel-Name"
+_HEADER_KIND: Final[str] = "X-Imgw-Kind"
 
 
 class _ProtocolError(Exception):
@@ -108,67 +120,67 @@ class _ProtocolError(Exception):
 
 
 # ---------------------------------------------------------------------------
-# Backend routing (tenant -> backend webhook, HANDOVER §13.3)
+# Backend configuration: one URL, one token, one timeout (HANDOVER §16)
 # ---------------------------------------------------------------------------
 
 
 @dataclass(frozen=True, slots=True)
 class BackendSpec:
-    """Everything the processor needs to call one backend."""
+    """Everything the processor needs to call the one agent backend."""
 
-    tenant_id: str
     base_url: str
-    token: str
-    timeout_ms: int
-    enabled: bool
+    token: str = ""
+    timeout_ms: int = DEFAULT_BACKEND_TIMEOUT_MS
 
 
-class BackendRouter:
-    """Resolve ``InboundMessage.tenant_id`` to the matching backend row.
+def resolve_backend_spec(
+    *,
+    backend_url: str | None = None,
+    env: Mapping[str, str] | None = None,
+) -> BackendSpec:
+    """Resolve the single backend from the CLI flag, the environment and defaults.
 
-    Routing is exact-match first, then the default backend (``tenant_id=""``).
-    Secret material is stored as an environment reference in the DB
-    (HANDOVER §13.5) and expanded in memory here; a missing variable expands to
-    an empty token instead of failing the turn — the backend will answer 401 and
-    the operator sees the configured-but-missing env var in the request.
+    Priority (GitHub issue #3): ``backend_url`` (``imgw run --backend-url``) >
+    ``IMGW_BACKEND_URL`` > :data:`DEFAULT_BACKEND_URL`.  ``IMGW_BACKEND_TOKEN``
+    is optional: when unset no ``Authorization`` header is sent.
+    ``IMGW_BACKEND_TIMEOUT_MS`` is optional and defaults to
+    :data:`DEFAULT_BACKEND_TIMEOUT_MS`; malformed / non-positive values fall
+    back to that default rather than failing the daemon.
     """
+    environ: Mapping[str, str] = os.environ if env is None else env
+    raw_url = backend_url if backend_url is not None else environ.get("IMGW_BACKEND_URL", "")
+    url = (raw_url or "").strip() or DEFAULT_BACKEND_URL
+    token = environ.get("IMGW_BACKEND_TOKEN", "").strip()
+    return BackendSpec(
+        base_url=url.rstrip("/"),
+        token=token,
+        timeout_ms=_env_positive_int(environ.get("IMGW_BACKEND_TIMEOUT_MS", ""), DEFAULT_BACKEND_TIMEOUT_MS),
+    )
 
-    def __init__(
-        self,
-        store: Store,
-        *,
-        env: Mapping[str, str] | None = None,
-        override: BackendSpec | None = None,
-    ) -> None:
-        self._store = store
-        self._env: Mapping[str, str] = os.environ if env is None else env
-        #: Dev mode: route every tenant to this backend instead of the DB rows.
-        self._override = override
 
-    def resolve(self, tenant_id: str | None) -> BackendSpec | None:
-        """Return the backend for *tenant_id*, falling back to the default one."""
-        if self._override is not None:
-            return self._override
-        lookup = tenant_id or ""
-        record = self._store.get_backend(lookup)
-        if record is None and lookup:
-            record = self._store.get_backend("")
-        if record is None or not record.enabled:
-            return None
-        return BackendSpec(
-            tenant_id=record.tenant_id,
-            base_url=record.base_url.rstrip("/"),
-            token=self._expand_token(record.token_ref),
-            timeout_ms=record.timeout_ms,
-            enabled=record.enabled,
-        )
+def resolve_backend_url(
+    channel_config: Mapping[str, Any] | None,
+    global_url: str,
+) -> str:
+    """Return the effective backend URL for one channel.
 
-    def _expand_token(self, token_ref: str) -> str:
-        match = _ENV_REF_PATTERN.match(token_ref.strip())
-        if match is None:
-            return token_ref
-        name = match.group(1) or match.group(2)
-        return self._env.get(name, "")
+    Future seam only: a channel's plain config dict may carry ``backend_url`` to
+    override the gateway-wide backend (no CLI flag / help exposure yet).  The
+    channel config is a plain JSON object, so this adds no table, column or
+    wire-contract change; absent or blank values fall back to *global_url*.
+    """
+    override = (channel_config or {}).get("backend_url")
+    if isinstance(override, str) and override.strip():
+        return override.strip().rstrip("/")
+    return global_url.rstrip("/")
+
+
+def _env_positive_int(raw: str, default: int) -> int:
+    try:
+        value = int(raw.strip())
+    except (AttributeError, ValueError):
+        return default
+    return value if value > 0 else default
 
 
 # ---------------------------------------------------------------------------
@@ -178,12 +190,6 @@ class BackendRouter:
 
 def _new_async_client() -> httpx.AsyncClient:
     return httpx.AsyncClient()
-
-
-def _coerce_positive_int(value: Any, default: int) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        return default
-    return value
 
 
 def _durable_subject_metadata(metadata: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -218,17 +224,16 @@ class TurnProcessor:
     def __init__(
         self,
         store: Store,
-        router: BackendRouter,
+        backend: BackendSpec | None = None,
         *,
         events: EventBus | None = None,
         capabilities_for_kind: Callable[[str], ChannelCapabilities] = capabilities_for,
         http_client_factory: Callable[[], httpx.AsyncClient] | None = None,
         clock: Callable[[], float] = time.time,
         error_texts: dict[str, str] | None = None,
-        default_deadline_ms: int = _FALLBACK_DEADLINE_MS,
     ) -> None:
         self._store = store
-        self._router = router
+        self._backend = backend if backend is not None else resolve_backend_spec()
         self._events = events
         self._capabilities_for_kind = capabilities_for_kind
         self._http_client_factory = http_client_factory
@@ -237,11 +242,15 @@ class TurnProcessor:
         if error_texts:
             merged.update(error_texts)
         self._error_texts = merged
-        self._default_deadline_ms = default_deadline_ms
         #: Turns currently being processed; the runtime uses it for graceful
         #: shutdown (stop accepting -> wait until this drops to 0).  A plain int
         #: is enough: the daemon has exactly one event loop.
         self._active = 0
+
+    @property
+    def backend(self) -> BackendSpec:
+        """The single backend this processor posts to (read-only)."""
+        return self._backend
 
     @property
     def active_turns(self) -> int:
@@ -291,14 +300,12 @@ class TurnProcessor:
                 }
             )
 
-            spec = self._router.resolve(message.tenant_id)
-            if spec is None or not spec.enabled:
-                yield self._record_outbound_error(
-                    message, subject, turn_id, self._error_texts["backend_down"]
-                )
-                return
-
-            deadline_ms = spec.timeout_ms or self._default_deadline_ms
+            spec = self._backend
+            record = self._store.get_channel(message.channel_id)
+            backend_url = resolve_backend_url(
+                record.config if record is not None else None, spec.base_url
+            )
+            deadline_ms = spec.timeout_ms
             start = start_from_inbound(
                 message,
                 session_key=subject.subject_id,
@@ -308,7 +315,14 @@ class TurnProcessor:
                 turn_id=turn_id,
             )
             async with aclosing(
-                self._stream_turn(message, subject, spec, start, turn_id)
+                self._stream_turn(
+                    message,
+                    subject,
+                    backend_url,
+                    self._request_headers(message, record),
+                    start,
+                    turn_id,
+                )
             ) as events:
                 async for event in events:
                     yield event
@@ -332,16 +346,42 @@ class TurnProcessor:
 
     # -- backend stream --------------------------------------------------------
 
+    def _request_headers(
+        self, message: InboundMessage, record: ChannelRecord | None
+    ) -> dict[str, str]:
+        """Build the POST headers, including reverse-proxy distribution headers.
+
+        The channel id / kind come from the channel record when it exists (the
+        record is the source of truth); they fall back to the inbound message so
+        the processor still works when it is used without a persisted channel.
+        An empty channel name omits ``X-Imgw-Channel-Name`` entirely.
+        """
+        channel_id = record.channel_id if record is not None else message.channel_id
+        kind = record.kind if record is not None else (message.channel_type or "unknown")
+        headers: dict[str, str] = {
+            "Accept": "text/event-stream",
+            "Content-Type": "application/json",
+            _HEADER_CHANNEL_ID: channel_id,
+            _HEADER_KIND: kind,
+        }
+        if record is not None and record.name:
+            headers[_HEADER_CHANNEL_NAME] = record.name
+        if self._backend.token:
+            # An empty token must omit the header: httpx rejects a literal
+            # "Bearer " as an illegal header value.
+            headers["Authorization"] = f"Bearer {self._backend.token}"
+        return headers
+
     async def _stream_turn(
         self,
         message: InboundMessage,
         subject: ChannelSubject,
-        spec: BackendSpec,
+        backend_url: str,
+        request_headers: dict[str, str],
         start: TurnFrame,
         turn_id: str,
     ) -> AsyncGenerator[MessageEvent, None]:
         """POST the start frame and translate the SSE response into events."""
-        deadline_ms = start.deadline_ms or self._default_deadline_ms
         client_factory: Callable[[], httpx.AsyncClient] = (
             self._http_client_factory or _new_async_client
         )
@@ -350,18 +390,10 @@ class TurnProcessor:
         delta_buffer: list[str] = []
 
         async with client_factory() as client:
-            async with asyncio.timeout(deadline_ms / 1000):
-                request_headers: dict[str, str] = {
-                    "Accept": "text/event-stream",
-                    "Content-Type": "application/json",
-                }
-                if spec.token:
-                    # An empty token (e.g. `${ENV}` not set) must omit the header:
-                    # httpx rejects a literal "Bearer " as an illegal header value.
-                    request_headers["Authorization"] = f"Bearer {spec.token}"
+            async with asyncio.timeout(self._backend.timeout_ms / 1000):
                 async with client.stream(
                     "POST",
-                    f"{spec.base_url}{_TURNS_PATH}",
+                    f"{backend_url}{_TURNS_PATH}",
                     headers=request_headers,
                     content=start.model_dump_json(),
                 ) as response:
@@ -633,28 +665,24 @@ class TurnProcessor:
 def build_processor(
     store: Store,
     *,
+    backend: BackendSpec | None = None,
     events: EventBus | None = None,
     http_client_factory: Callable[[], httpx.AsyncClient] | None = None,
-    dev_backend: BackendSpec | None = None,
 ) -> TurnProcessor:
     """Build the production processor from SQLite settings (HANDOVER §13.2).
 
     ``settings.error_texts`` is merged over :data:`DEFAULT_ERROR_TEXTS` (keys are
-    fixed) and ``settings.turn_deadline_ms`` overrides the fallback deadline.
+    fixed).  The backend URL / token / timeout come from the CLI flag and
+    environment (:func:`resolve_backend_spec`), never from the database.
     """
     error_texts = dict(DEFAULT_ERROR_TEXTS)
     stored_texts = store.get_setting("error_texts", {})
     if isinstance(stored_texts, dict):
         error_texts.update({str(key): str(value) for key, value in stored_texts.items()})
-    default_deadline_ms = _coerce_positive_int(
-        store.get_setting("turn_deadline_ms", _FALLBACK_DEADLINE_MS),
-        _FALLBACK_DEADLINE_MS,
-    )
     return TurnProcessor(
         store,
-        BackendRouter(store, override=dev_backend),
+        backend,
         events=events,
         http_client_factory=http_client_factory,
         error_texts=error_texts,
-        default_deadline_ms=default_deadline_ms,
     )

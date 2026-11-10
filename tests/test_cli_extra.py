@@ -346,7 +346,19 @@ def test_run_command_delegates_to_daemon(monkeypatch: pytest.MonkeyPatch) -> Non
     monkeypatch.setattr(gateway_app, "run_daemon", lambda **kwargs: calls.append(kwargs))
     result = invoke("run", "--host", "127.0.0.1", "--port", "9999")
     assert result.exit_code == 0, result.stderr
-    assert calls == [{"host": "127.0.0.1", "port": 9999}]
+    assert calls == [{"host": "127.0.0.1", "port": 9999, "backend_url": None}]
+
+
+def test_run_command_passes_backend_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    from im_gateway.gateway import app as gateway_app
+
+    calls: list[dict[str, Any]] = []
+    monkeypatch.setattr(gateway_app, "run_daemon", lambda **kwargs: calls.append(kwargs))
+    result = invoke("run", "--backend-url", "http://127.0.0.1:7777")
+    assert result.exit_code == 0, result.stderr
+    assert calls == [
+        {"host": "127.0.0.1", "port": 8765, "backend_url": "http://127.0.0.1:7777"}
+    ]
 
 
 def test_run_dev_command_delegates_with_dev_backend(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -364,6 +376,13 @@ def test_run_dev_command_delegates_with_dev_backend(monkeypatch: pytest.MonkeyPa
             "dev_backend_port": 9911,
         }
     ]
+
+
+def test_channel_login_no_longer_accepts_tenant(backend: FakeBackend) -> None:
+    result = invoke("channel", "login", "feishu", "--tenant", "acme")
+    assert result.exit_code == 2
+    assert "No such option" in result.stderr or "no such option" in result.stderr
+    assert backend.requests == []
 
 
 def test_channel_list_empty(backend: FakeBackend) -> None:
@@ -468,6 +487,96 @@ def test_channel_login_timeout_must_be_positive(backend: FakeBackend) -> None:
     result = invoke("channel", "login", "sales", "--timeout", "0")
     assert result.exit_code == 1
     assert "--timeout must be a positive number" in result.stderr
+
+
+def test_channel_login_posts_timeout_and_hints_validity(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli.time, "sleep", lambda seconds: None)
+    backend.route(
+        "GET",
+        "/v1/channels/sales",
+        {
+            "channel_id": "feishu:acme:sales",
+            "login_supported": True,
+            "credentials": {"configured": False},
+        },
+    )
+    backend.route(
+        "POST",
+        "/v1/channels/feishu:acme:sales/login",
+        {
+            "session_id": "session-1",
+            "status": "pending",
+            "qr_content": "https://example.com/qr",
+            "kind": "dingtalk",
+            "expires_in_s": 900,
+        },
+    )
+    backend.route(
+        "GET",
+        "/v1/channels/feishu:acme:sales/login/session-1",
+        {"session_id": "session-1", "status": "confirmed"},
+    )
+    backend.route(
+        "GET",
+        "/v1/channels/feishu:acme:sales",
+        {"channel_id": "feishu:acme:sales", "state": "running"},
+    )
+
+    result = invoke("channel", "login", "sales")
+
+    assert result.exit_code == 0, result.stderr
+    body = json.loads(backend.recorded("POST", "/v1/channels/feishu:acme:sales/login").content)
+    assert body == {"timeout_s": 900.0}  # default is 15 minutes
+    assert (
+        "Scan the QR code with DingTalk (valid for 15 minutes), "
+        "or open this link in DingTalk: https://example.com/qr" in result.stderr
+    )
+
+
+def test_channel_login_hint_without_platform_ttl_omits_validity(
+    backend: FakeBackend, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(cli.time, "sleep", lambda seconds: None)
+    backend.route(
+        "GET",
+        "/v1/channels/sales",
+        {
+            "channel_id": "feishu:acme:sales",
+            "login_supported": True,
+            "credentials": {"configured": False},
+        },
+    )
+    backend.route(
+        "POST",
+        "/v1/channels/feishu:acme:sales/login",
+        {
+            "session_id": "session-1",
+            "status": "pending",
+            "qr_content": "https://example.com/qr",
+            "kind": "wecom",
+        },
+    )
+    backend.route(
+        "GET",
+        "/v1/channels/feishu:acme:sales/login/session-1",
+        {"session_id": "session-1", "status": "confirmed"},
+    )
+    backend.route(
+        "GET",
+        "/v1/channels/feishu:acme:sales",
+        {"channel_id": "feishu:acme:sales", "state": "running"},
+    )
+
+    result = invoke("channel", "login", "sales")
+
+    assert result.exit_code == 0, result.stderr
+    assert (
+        "Scan the QR code with WeCom, or open this link in WeCom: https://example.com/qr"
+        in result.stderr
+    )
+    assert "valid for" not in result.stderr  # never invent a validity
 
 
 def _login_routes(backend: FakeBackend, *, final_state: str = "running") -> None:
@@ -683,7 +792,7 @@ def test_config_export_write_failure_exits_one(backend: FakeBackend, tmp_path: P
     backend.route(
         "GET",
         "/v1/config/export",
-        {"version": 1, "channels": [], "backends": [], "settings": {}},
+        {"version": 2, "channels": [], "settings": {}},
     )
     directory = tmp_path / "not-a-file"
     directory.mkdir()
@@ -696,11 +805,11 @@ def test_config_import_json_output(backend: FakeBackend, tmp_path: Path) -> None
     backend.route(
         "POST",
         "/v1/config/import",
-        {"applied": {"channels": 0, "backends": 0, "settings": 0}},
+        {"applied": {"channels": 0, "settings": 0}},
     )
     path = tmp_path / "config.json"
     path.write_text(
-        json.dumps({"version": 1, "channels": [], "backends": [], "settings": {}}),
+        json.dumps({"version": 2, "channels": [], "settings": {}}),
         encoding="utf-8",
     )
     result = invoke("--json", "config", "import", str(path))

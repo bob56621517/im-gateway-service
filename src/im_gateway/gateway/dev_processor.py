@@ -5,7 +5,7 @@ the result (HANDOVER §11.2 #1), so this **must** be an async generator function
 — an ``async def`` returning an async iterator would raise ``TypeError``.
 
 Milestone 2 replaces this with the real model-A processor: persist the inbound
-message, POST a ``TurnFrame`` (``kind=start``) to the tenant backend, translate
+message, POST a ``TurnFrame`` (``kind=start``) to the single backend URL, translate
 the backend's SSE frame stream into ``MessageEvent`` objects, and always emit a
 terminal ``completed``/``error`` event (HANDOVER §11.2 #2/#3 — the upstream
 swallows processor exceptions, so error reporting must happen in-band).

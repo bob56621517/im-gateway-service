@@ -37,6 +37,7 @@ IMGW_LANG=zh_CN.UTF-8 uv run imgw channel login --help
 
 - **stdout = 数据，stderr = 提示**：`| grep` / `| awk` 只会拿到数据行；进度、告警、错误一律走 stderr。
 - 全局参数：`--url`（或 `IMGW_URL`）、`--token`（或 `IMGW_TOKEN` / `IMGW_TOKEN_FILE` / token 文件）、`--json`。
+- 后端参数（`run` / `run-dev` 所在进程）：`--backend-url`（或 `IMGW_BACKEND_URL`，默认 `http://127.0.0.1:8080`）、`IMGW_BACKEND_TOKEN`（可选，未设置时不发 `Authorization` 头）、`IMGW_BACKEND_TIMEOUT_MS`（默认 120000）。
 - 退出码：成功 `0`；失败 / 超时 / 未就绪 `1`；参数用法错误 `2`（由 CLI 框架报告）。
 - 写操作都会落审计；secret 不落日志、不进 `/v1/status`，`channel list` 详情视图里一律 `***`。
 - 除 `run` / `run-dev` 外，所有命令只调 daemon 控制面（`--url` + `--token`），不直接读写 SQLite。
@@ -73,7 +74,21 @@ IMGW_LANG=zh_CN.UTF-8 uv run imgw channel login --help
 
 `channel add`、`channel ls`、`channel show`、`channel rm`、`channel enable`、`channel disable` 已删除，**不提供别名**。
 
-### 3.4 迁移示例
+### 3.4 后端路由层移除（2026-11-10，GitHub issue #3）
+
+后端从「`backends` 表 + 每通道 tenant 路由」简化为「一个 URL，POST only」：
+
+| 变更 | 说明 |
+|---|---|
+| 新增 `imgw run --backend-url <url>` | 优先级：flag > `IMGW_BACKEND_URL` > `http://127.0.0.1:8080` |
+| 删除 `channel login --tenant` | 通道不再有 tenant；配置文档 v1 的 `backends[]` / `tenant_id` 会被明确拒绝 |
+| `imgw status` | 不再显示 backends 计数，改为只读 `backend_url` |
+| `imgw run-dev` | 不再覆盖 tenant 路由，改为把全局 backend URL 指向进程内回显后端 |
+| 迁移 | 启动时自动 schema v1→v2（删除 `backends` 表与 `channels.tenant_id`），历史通道/消息数据保留 |
+
+`TurnFrame` 线上契约不变；`start.channel.tenant_id` 作为冻结字段保留，恒为 `""`。
+
+### 3.5 迁移示例
 
 ```bash
 # 旧：手工建通道并禁用

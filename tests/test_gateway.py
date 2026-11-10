@@ -46,12 +46,11 @@ CHANNEL_ID = "feishu:acme:sales"
 CHANNEL_CONFIG = {"app_id": "cli_x", "app_secret": "literal-secret"}
 
 INITIAL_DOC: dict[str, Any] = {
-    "version": 1,
+    "version": 2,
     "channels": [
         {
             "channel_id": CHANNEL_ID,
             "kind": "feishu",
-            "tenant_id": "acme",
             "alias": "sales",
             "name": "Sales",
             "enabled": True,
@@ -61,14 +60,6 @@ INITIAL_DOC: dict[str, Any] = {
                 "verification_token": "${FEISHU_VERIFICATION_TOKEN}",
             },
             "constraints": {},
-        }
-    ],
-    "backends": [
-        {
-            "tenant_id": "acme",
-            "base_url": "http://127.0.0.1:9000",
-            "token_ref": "literal-backend-token",
-            "timeout_ms": 5000,
         }
     ],
     "settings": {"workers_per_channel": 2},
@@ -108,7 +99,6 @@ class StubManager:
         channel_type: str,
         config: Any,
         channel_id: str,
-        tenant_id: str | None,
         constraints: ChannelConstraints | None = None,
     ) -> str:
         if channel_type in self.fail_add_kinds:
@@ -120,7 +110,6 @@ class StubManager:
                 "channel_type": channel_type,
                 "config": config,
                 "channel_id": channel_id,
-                "tenant_id": tenant_id,
                 "constraints": constraints,
             }
         )
@@ -134,7 +123,6 @@ class StubManager:
         channel_type: str,
         config: Any,
         *,
-        tenant_id: str | None = None,
         channel_id: str | None = None,
     ) -> None:
         if channel_type in self.fail_probe_kinds:
@@ -143,7 +131,6 @@ class StubManager:
             {
                 "channel_type": channel_type,
                 "config": config,
-                "tenant_id": tenant_id,
                 "channel_id": channel_id,
             }
         )
@@ -187,7 +174,6 @@ def channel_body(**overrides: Any) -> dict[str, Any]:
     body: dict[str, Any] = {
         "channel_id": CHANNEL_ID,
         "kind": "feishu",
-        "tenant_id": "acme",
         "alias": "sales",
         "name": "Sales",
         "enabled": True,
@@ -244,7 +230,7 @@ def test_auth_is_required_everywhere_else(harness: Harness) -> None:
     assert payload["db_path"].endswith("runtime.db")
     assert payload["counts"] == {"channels": 0, "messages": 0, "subjects": 0}
     assert payload["channels"] == []
-    assert payload["backends"] == 0
+    assert payload["backend_url"].startswith(("http://", "https://"))
 
 
 def test_version_reports_daemon_and_upstream(harness: Harness) -> None:
@@ -275,7 +261,6 @@ def test_channels_crud_and_manager_calls(harness: Harness) -> None:
     assert set(created) == {
         "channel_id",
         "kind",
-        "tenant_id",
         "alias",
         "name",
         "enabled",
@@ -299,7 +284,6 @@ def test_channels_crud_and_manager_calls(harness: Harness) -> None:
     upstream = harness.manager.added[0]
     assert upstream["channel_type"] == "feishu"
     assert upstream["channel_id"] == CHANNEL_ID
-    assert upstream["tenant_id"] == "acme"
     assert upstream["config"] == CHANNEL_CONFIG
     assert isinstance(upstream["constraints"], ChannelConstraints)
     assert upstream["constraints"].show_thinking is True
@@ -441,7 +425,6 @@ def test_probe_success_and_credential_failure(harness: Harness) -> None:
     body = {
         "channel_id": "feishu:probe",
         "kind": "feishu",
-        "tenant_id": "acme",
         "config": {"app_id": "cli_x", "app_secret": "literal-secret"},
     }
     ok = harness.client.post("/v1/channels/probe", json=body, headers=AUTH)
@@ -468,21 +451,21 @@ def test_probe_success_and_credential_failure(harness: Harness) -> None:
 
 def test_config_export_masks_literal_secrets(harness: Harness) -> None:
     imported = import_doc(harness, INITIAL_DOC)
-    assert imported["applied"] == {"channels": 1, "backends": 1, "settings": 1}
+    assert imported["applied"] == {"channels": 1, "settings": 1}
     assert len(harness.manager.added) == 1
 
     exported = harness.client.get("/v1/config/export", headers=AUTH).json()
-    assert exported["version"] == 1
+    assert exported["version"] == 2
+    assert "backends" not in exported
     channel = exported["channels"][0]
     assert channel["channel_id"] == CHANNEL_ID
+    assert "tenant_id" not in channel
     assert channel["config"]["app_secret"] == MASKED_SECRET
     assert channel["config"]["verification_token"] == "${FEISHU_VERIFICATION_TOKEN}"
-    assert exported["backends"][0]["token_ref"] == MASKED_SECRET
     assert exported["settings"] == {"workers_per_channel": 2}
 
     raw = harness.client.get("/v1/config/export", params={"with_secrets": "true"}, headers=AUTH).json()
     assert raw["channels"][0]["config"]["app_secret"] == "literal-secret"
-    assert raw["backends"][0]["token_ref"] == "literal-backend-token"
 
 
 def test_config_import_keeps_masked_values_and_deletes_absent_entries(
@@ -493,17 +476,14 @@ def test_config_import_keeps_masked_values_and_deletes_absent_entries(
     masked["channels"][0]["name"] = "Renamed via import"
     masked["channels"][0]["alias"] = "sales2"
     applied = import_doc(harness, masked)
-    assert applied == {"applied": {"channels": 1, "backends": 1, "settings": 1}, "warnings": []}
+    assert applied == {"applied": {"channels": 1, "settings": 1}, "warnings": []}
 
     stored = harness.store.get_channel(CHANNEL_ID)
     assert stored is not None
     assert stored.name == "Renamed via import"
     assert stored.alias == "sales2"
-    # ``***`` means "keep the current value", so neither secret was lost.
+    # ``***`` means "keep the current value", so the secret was not lost.
     assert stored.config["app_secret"] == "literal-secret"
-    backend = harness.store.get_backend("acme")
-    assert backend is not None
-    assert backend.token_ref == "literal-backend-token"
     # Alias/name-only import does not restart the channel.
     assert len(harness.manager.added) == 1
 
@@ -514,7 +494,6 @@ def test_config_import_keeps_masked_values_and_deletes_absent_entries(
         {
             "channel_id": "feishu:acme:support",
             "kind": "feishu",
-            "tenant_id": "acme",
             "alias": "support",
             "name": "Support",
             "enabled": True,
@@ -525,7 +504,7 @@ def test_config_import_keeps_masked_values_and_deletes_absent_entries(
     assert import_doc(harness, extended)["applied"]["channels"] == 2
     assert len(harness.manager.added) == 2
 
-    # Imports delete channels/backends missing from the document.
+    # Imports delete channels missing from the document.
     only_support = dict(extended)
     only_support["channels"] = [extended["channels"][1]]
     import_doc(harness, only_support)
@@ -536,40 +515,49 @@ def test_config_import_keeps_masked_values_and_deletes_absent_entries(
 def test_config_import_invalid_document_is_400_and_writes_nothing(harness: Harness) -> None:
     import_doc(harness, INITIAL_DOC)
     channels_before = harness.store.list_channels()
-    backends_before = harness.store.list_backends()
     settings_before = harness.store.get_settings()
 
     invalid = {
-        "version": 1,
+        "version": 2,
         "channels": [{"channel_id": "bad:1", "kind": "not-a-kind"}],
-        "backends": [{"tenant_id": "", "base_url": "http://127.0.0.1:1", "token_ref": "${T}"}],
     }
     response = harness.client.post("/v1/config/import", json=invalid, headers=AUTH)
     assert response.status_code == 400
     assert "detail" in response.json()
 
     assert harness.store.list_channels() == channels_before
-    assert harness.store.list_backends() == backends_before
     assert harness.store.get_settings() == settings_before
     assert len(harness.manager.added) == 1
 
     # A masked secret on a brand-new channel has nothing to resolve to.
     new_masked = {
-        "version": 1,
+        "version": 2,
         "channels": [
             {
                 "channel_id": "feishu:acme:new",
                 "kind": "feishu",
-                "tenant_id": "acme",
                 "enabled": True,
                 "config": {"app_id": "cli_new", "app_secret": MASKED_SECRET},
                 "constraints": {},
             }
         ],
-        "backends": [{"tenant_id": "acme", "base_url": "http://127.0.0.1:9000", "token_ref": "${T}"}],
     }
     assert harness.client.post("/v1/config/import", json=new_masked, headers=AUTH).status_code == 400
     assert harness.store.get_channel("feishu:acme:new") is None
+
+
+def test_config_import_rejects_version_1_with_removed_fields(harness: Harness) -> None:
+    response = harness.client.post(
+        "/v1/config/import",
+        json={
+            "version": 1,
+            "channels": [],
+            "backends": [{"tenant_id": "", "base_url": "http://127.0.0.1:1", "token_ref": "${T}"}],
+        },
+        headers=AUTH,
+    )
+    assert response.status_code == 400
+    assert "tenant/backends" in response.json()["detail"]
 
 
 def test_config_import_manager_failure_warns_but_keeps_db(harness: Harness) -> None:
@@ -583,7 +571,6 @@ def test_config_import_manager_failure_warns_but_keeps_db(harness: Harness) -> N
         {
             "channel_id": "wecom:acme:ops",
             "kind": "wecom",
-            "tenant_id": "acme",
             "name": "Ops",
             "enabled": True,
             "config": {"bot_id": "bot", "secret": "literal-secret"},
@@ -929,6 +916,31 @@ def test_run_daemon_host_port(daemon_env: dict[str, Any]) -> None:
     assert daemon_env["app"].state.runtime is not None
 
 
+def test_run_daemon_accepts_backend_url(daemon_env: dict[str, Any]) -> None:
+    run_daemon(backend_url="http://127.0.0.1:1234/", db=daemon_env["db"])
+    assert daemon_env["app"].state.runtime.backend_url == "http://127.0.0.1:1234"
+
+
+def test_run_daemon_dev_backend_overrides_global_backend_url(
+    daemon_env: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``run-dev`` points the *global* backend URL at the in-process echo backend."""
+    monkeypatch.setenv("IMGW_BACKEND_URL", "http://env.test")
+
+    class FakeDevServer:
+        def __init__(self, config: Any) -> None:
+            self.config = config
+            self.started = False
+
+        def run(self) -> None:
+            self.started = True
+
+    monkeypatch.setattr(uvicorn, "Server", FakeDevServer)
+    run_daemon(db=daemon_env["db"], dev_backend=True, dev_backend_port=9911)
+
+    assert daemon_env["app"].state.runtime.backend_url == "http://127.0.0.1:9911"
+
+
 def test_run_daemon_explicit_listen_wins(daemon_env: dict[str, Any]) -> None:
     run_daemon(
         listen="tcp://0.0.0.0:1234",
@@ -966,8 +978,8 @@ def test_config_document_roundtrips_from_export(harness: Harness) -> None:
     import_doc(harness, INITIAL_DOC)
     exported = harness.client.get("/v1/config/export", headers=AUTH).json()
     document = ConfigDocument.model_validate(exported)
+    assert document.version == 2
     assert [entry.channel_id for entry in document.channels] == [CHANNEL_ID]
-    assert [entry.tenant_id for entry in document.backends] == ["acme"]
 
 
 # ---------------------------------------------------------------------------

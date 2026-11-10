@@ -1,8 +1,11 @@
-"""Tests for the model-A turn processor (HANDOVER §12) and dedup keys (§11.4).
+"""Tests for the model-A turn processor (HANDOVER §12, §16) and dedup keys.
 
 No network, no platform SDKs: the backend is an :class:`httpx.MockTransport`
 injected through ``http_client_factory`` and every test gets its own temporary
 SQLite database.
+
+Backend configuration is the version-2 model: one URL, one optional token, one
+timeout (CLI flag > environment > default). There is no tenant/backend table.
 """
 
 from __future__ import annotations
@@ -11,7 +14,7 @@ import asyncio
 import inspect
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -19,15 +22,18 @@ import httpx
 import pytest
 from octop_gateway.models import ChannelSubject, InboundMessage, MessageEvent, MessageEventType, TextContent
 
-from im_gateway.db.models import BackendRecord, SubjectRecord
+from im_gateway.db.models import ChannelRecord, SubjectRecord
 from im_gateway.db.store import Store
 from im_gateway.gateway.idempotency import build_idempotency_key, extract_platform_message_id
 from im_gateway.gateway.processor import (
+    DEFAULT_BACKEND_TIMEOUT_MS,
+    DEFAULT_BACKEND_URL,
     DEFAULT_ERROR_TEXTS,
-    BackendRouter,
     BackendSpec,
     TurnProcessor,
     build_processor,
+    resolve_backend_spec,
+    resolve_backend_url,
 )
 
 BASE_URL = "http://backend.test"
@@ -47,27 +53,33 @@ def store(db_path: Path) -> Store:
     return store
 
 
-def add_backend(
+def add_channel_record(
     store: Store,
     *,
-    tenant_id: str = "",
-    base_url: str = BASE_URL,
-    token_ref: str = TOKEN,
-    timeout_ms: int = 3000,
-    enabled: bool = True,
+    channel_id: str = "feishu:acme:sales",
+    kind: str = "feishu",
+    name: str = "Sales",
+    alias: str | None = None,
+    config: dict[str, Any] | None = None,
 ) -> None:
     now = time.time()
-    store.upsert_backend(
-        BackendRecord(
-            tenant_id=tenant_id,
-            base_url=base_url,
-            token_ref=token_ref,
-            timeout_ms=timeout_ms,
-            enabled=enabled,
+    store.add_channel(
+        ChannelRecord(
+            channel_id=channel_id,
+            kind=kind,
+            alias=alias,
+            name=name,
+            config=dict(config or {}),
+            constraints={},
+            enabled=True,
             created_at=now,
             updated_at=now,
         )
     )
+
+
+def default_spec(timeout_ms: int = 3000) -> BackendSpec:
+    return BackendSpec(base_url=BASE_URL, token=TOKEN, timeout_ms=timeout_ms)
 
 
 def make_message(
@@ -117,10 +129,16 @@ class FakeBackend:
         return factory
 
 
-def make_processor(store: Store, backend: FakeBackend, **kwargs: Any) -> TurnProcessor:
+def make_processor(
+    store: Store,
+    backend: FakeBackend,
+    *,
+    spec: BackendSpec | None = None,
+    **kwargs: Any,
+) -> TurnProcessor:
     return TurnProcessor(
         store,
-        BackendRouter(store),
+        spec if spec is not None else default_spec(),
         http_client_factory=backend.client_factory(),
         **kwargs,
     )
@@ -147,7 +165,7 @@ def start_payload(seq: int = 0) -> dict[str, Any]:
         "turn_id": BACKEND_TURN_ID,
         "seq": seq,
         "kind": "start",
-        "channel": {"channel_id": "feishu:acme:sales", "kind": "feishu", "tenant_id": "acme"},
+        "channel": {"channel_id": "feishu:acme:sales", "kind": "feishu", "tenant_id": ""},
         "subject": {"subject_id": "ou_1"},
         "session_key": "ou_1",
         "idempotency_key": "feishu:acme:sales:om_x",
@@ -185,12 +203,64 @@ def static_handler(*frames: dict[str, Any]) -> Callable[[httpx.Request], httpx.R
 
 
 # ---------------------------------------------------------------------------
-# 1. Happy path: request frame, SSE -> MessageEvent mapping, persistence
+# Backend URL / token / timeout resolution (no tenant/backend table)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_backend_spec_defaults() -> None:
+    spec = resolve_backend_spec(env={})
+
+    assert spec == BackendSpec(
+        base_url=DEFAULT_BACKEND_URL,
+        token="",
+        timeout_ms=DEFAULT_BACKEND_TIMEOUT_MS,
+    )
+    assert DEFAULT_BACKEND_URL == "http://127.0.0.1:8080"
+    assert DEFAULT_BACKEND_TIMEOUT_MS == 120_000
+
+
+def test_resolve_backend_spec_env_and_flag_priority() -> None:
+    env: Mapping[str, str] = {
+        "IMGW_BACKEND_URL": "http://env.test/",
+        "IMGW_BACKEND_TOKEN": "env-token",
+        "IMGW_BACKEND_TIMEOUT_MS": "5000",
+    }
+    from_env = resolve_backend_spec(env=env)
+    assert from_env.base_url == "http://env.test"
+    assert from_env.token == "env-token"
+    assert from_env.timeout_ms == 5000
+
+    # The explicit flag (imgw run --backend-url) wins over the environment.
+    explicit = resolve_backend_spec(backend_url="http://cli.test/", env=env)
+    assert explicit.base_url == "http://cli.test"
+
+
+@pytest.mark.parametrize("raw", ["", "  ", "not-a-number", "0", "-5"])
+def test_resolve_backend_spec_falls_back_on_bad_timeout(raw: str) -> None:
+    spec = resolve_backend_spec(env={"IMGW_BACKEND_TIMEOUT_MS": raw})
+    assert spec.timeout_ms == DEFAULT_BACKEND_TIMEOUT_MS
+
+
+def test_resolve_backend_url_seam() -> None:
+    """Future seam: a plain per-channel config key may override the global URL."""
+    assert resolve_backend_url(None, "http://global.test/") == "http://global.test"
+    assert resolve_backend_url({}, "http://global.test") == "http://global.test"
+    assert (
+        resolve_backend_url({"backend_url": "http://channel.test/"}, "http://global.test")
+        == "http://channel.test"
+    )
+    # Anything that is not a non-blank string falls back to the global URL.
+    assert resolve_backend_url({"backend_url": ""}, "http://global.test") == "http://global.test"
+    assert resolve_backend_url({"backend_url": 42}, "http://global.test") == "http://global.test"
+
+
+# ---------------------------------------------------------------------------
+# 1. Happy path: request frame, headers, SSE -> MessageEvent mapping, persistence
 # ---------------------------------------------------------------------------
 
 
 async def test_normal_turn_streams_events_and_persists(store: Store) -> None:
-    add_backend(store, tenant_id="acme", timeout_ms=3000)
+    add_channel_record(store, name="Sales")
     backend = FakeBackend(
         static_handler(
             frame(1, "typing"),
@@ -200,7 +270,11 @@ async def test_normal_turn_streams_events_and_persists(store: Store) -> None:
         )
     )
     message = make_message(metadata={"message_id": "om_1"})
-    processor = build_processor(store, http_client_factory=backend.client_factory())
+    processor = build_processor(
+        store,
+        backend=default_spec(),
+        http_client_factory=backend.client_factory(),
+    )
 
     events = await collect(processor, message)
 
@@ -214,7 +288,7 @@ async def test_normal_turn_streams_events_and_persists(store: Store) -> None:
     assert events[2].content[0].text == "好"
     assert processor.active_turns == 0
 
-    # --- request frame ---
+    # --- request frame / URL / distribution headers ---
     assert len(backend.calls) == 1
     request = backend.calls[0]
     assert request.method == "POST"
@@ -223,12 +297,17 @@ async def test_normal_turn_streams_events_and_persists(store: Store) -> None:
     assert request.headers["authorization"] == f"Bearer {TOKEN}"
     assert request.headers["accept"] == "text/event-stream"
     assert request.headers["content-type"] == "application/json"
+    assert request.headers["x-imgw-channel-id"] == "feishu:acme:sales"
+    assert request.headers["x-imgw-channel-name"] == "Sales"
+    assert request.headers["x-imgw-kind"] == "feishu"
     body = json.loads(request.content)
     assert body["kind"] == "start"
     assert body["channel"] == {
         "channel_id": "feishu:acme:sales",
         "kind": "feishu",
-        "tenant_id": "acme",
+        # Frozen wire field: tenants are gone, so it is always empty even though
+        # the upstream InboundMessage still carries one.
+        "tenant_id": "",
     }
     assert body["subject"]["subject_id"] == "ou_1"
     assert body["session_key"] == "ou_1"
@@ -267,13 +346,50 @@ async def test_normal_turn_streams_events_and_persists(store: Store) -> None:
     assert store.claim_inbound("feishu:acme:sales:om_1", message.channel_id) is False
 
 
+async def test_default_backend_url_is_used_without_any_config(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No backend row/config: the default URL is used; nothing needs provisioning."""
+    monkeypatch.delenv("IMGW_BACKEND_URL", raising=False)
+    monkeypatch.delenv("IMGW_BACKEND_TOKEN", raising=False)
+    backend = FakeBackend(static_handler(frame(1, "completed")))
+    processor = build_processor(store, http_client_factory=backend.client_factory())
+
+    events = await collect(processor, make_message())
+
+    assert event_types(events) == [MessageEventType.COMPLETED]
+    assert str(backend.calls[0].url) == f"{DEFAULT_BACKEND_URL}/v1/turns"
+    assert "authorization" not in backend.calls[0].headers
+
+
+async def test_channel_name_empty_omits_distribution_header(store: Store) -> None:
+    add_channel_record(store, name="")
+    backend = FakeBackend(static_handler(frame(1, "completed")))
+    processor = make_processor(store, backend)
+
+    await collect(processor, make_message())
+
+    assert backend.calls[0].headers["x-imgw-channel-id"] == "feishu:acme:sales"
+    assert "x-imgw-channel-name" not in backend.calls[0].headers
+
+
+async def test_per_channel_backend_url_seam_is_additive(store: Store) -> None:
+    """A plain channel config key overrides the global URL (no CLI/help exposure)."""
+    add_channel_record(store, config={"backend_url": "http://override.test/"})
+    backend = FakeBackend(static_handler(frame(1, "completed")))
+    processor = make_processor(store, backend)
+
+    await collect(processor, make_message())
+
+    assert str(backend.calls[0].url) == "http://override.test/v1/turns"
+
+
 # ---------------------------------------------------------------------------
 # 2. Idempotency: a redelivered message does not call the backend twice
 # ---------------------------------------------------------------------------
 
 
 async def test_duplicate_message_yields_only_completed(store: Store) -> None:
-    add_backend(store, tenant_id="acme")
     backend = FakeBackend(static_handler(frame(1, "completed")))
     message = make_message(metadata={"message_id": "om_dup"})
     processor = make_processor(store, backend)
@@ -288,45 +404,11 @@ async def test_duplicate_message_yields_only_completed(store: Store) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 3./4. No usable backend
-# ---------------------------------------------------------------------------
-
-
-async def test_missing_backend_yields_backend_down(store: Store) -> None:
-    backend = FakeBackend(static_handler(frame(1, "completed")))
-    processor = make_processor(store, backend)
-
-    events = await collect(processor, make_message())
-
-    assert event_types(events) == [MessageEventType.ERROR]
-    assert events[0].error == DEFAULT_ERROR_TEXTS["backend_down"]
-    assert backend.calls == []
-    rows = store.query_history(channel_id="feishu:acme:sales", subject_id="ou_1")
-    # The inbound message is persisted before routing, then the error row.
-    assert [row.kind for row in rows] == ["error", "inbound"]
-    assert rows[0].direction == "out"
-    assert rows[0].error == DEFAULT_ERROR_TEXTS["backend_down"]
-
-
-async def test_disabled_backend_yields_backend_down(store: Store) -> None:
-    add_backend(store, tenant_id="acme", enabled=False)
-    backend = FakeBackend(static_handler(frame(1, "completed")))
-    processor = make_processor(store, backend)
-
-    events = await collect(processor, make_message())
-
-    assert event_types(events) == [MessageEventType.ERROR]
-    assert events[0].error == DEFAULT_ERROR_TEXTS["backend_down"]
-    assert backend.calls == []
-
-
-# ---------------------------------------------------------------------------
-# 5./6./7. HTTP-level failures
+# 3. HTTP-level failures
 # ---------------------------------------------------------------------------
 
 
 async def test_http_error_status_yields_error_with_status_code(store: Store) -> None:
-    add_backend(store, tenant_id="acme")
     backend = FakeBackend(lambda request: httpx.Response(500, json={"error": "boom"}))
     processor = make_processor(store, backend)
 
@@ -342,8 +424,6 @@ async def test_http_error_status_yields_error_with_status_code(store: Store) -> 
 
 
 async def test_connect_error_maps_to_backend_down(store: Store) -> None:
-    add_backend(store, tenant_id="acme")
-
     def handler(request: httpx.Request) -> httpx.Response:
         raise httpx.ConnectError("connection refused", request=request)
 
@@ -357,14 +437,12 @@ async def test_connect_error_maps_to_backend_down(store: Store) -> None:
 
 
 async def test_deadline_timeout_maps_to_backend_timeout(store: Store) -> None:
-    add_backend(store, tenant_id="acme", timeout_ms=100)
-
     async def handler(request: httpx.Request) -> httpx.Response:
         await asyncio.sleep(1)
         return sse_response(frame(1, "completed"))
 
     backend = FakeBackend(handler)
-    processor = make_processor(store, backend)
+    processor = make_processor(store, backend, spec=default_spec(timeout_ms=100))
 
     started = time.monotonic()
     events = await collect(processor, make_message())
@@ -377,12 +455,11 @@ async def test_deadline_timeout_maps_to_backend_timeout(store: Store) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 8./9./10. Broken frame streams
+# 4. Broken frame streams
 # ---------------------------------------------------------------------------
 
 
 async def test_eof_without_terminal_frame_yields_incomplete(store: Store) -> None:
-    add_backend(store, tenant_id="acme")
     backend = FakeBackend(static_handler(text_frame(1, "delta", "只说了一半")))
     processor = make_processor(store, backend)
 
@@ -394,7 +471,6 @@ async def test_eof_without_terminal_frame_yields_incomplete(store: Store) -> Non
 
 
 async def test_invalid_json_frame_yields_error(store: Store) -> None:
-    add_backend(store, tenant_id="acme")
     backend = FakeBackend(lambda request: raw_sse_response("data: this is not json\n\n"))
     processor = make_processor(store, backend)
 
@@ -405,7 +481,6 @@ async def test_invalid_json_frame_yields_error(store: Store) -> None:
 
 
 async def test_invalid_frame_missing_required_field_yields_error(store: Store) -> None:
-    add_backend(store, tenant_id="acme")
     backend = FakeBackend(lambda request: raw_sse_response('data: {"kind": "delta", "seq": 1}\n\n'))
     processor = make_processor(store, backend)
 
@@ -416,7 +491,6 @@ async def test_invalid_frame_missing_required_field_yields_error(store: Store) -
 
 
 async def test_sequence_gap_yields_error(store: Store) -> None:
-    add_backend(store, tenant_id="acme")
     backend = FakeBackend(
         static_handler(text_frame(1, "delta", "一"), frame(3, "completed"))
     )
@@ -429,7 +503,6 @@ async def test_sequence_gap_yields_error(store: Store) -> None:
 
 
 async def test_first_frame_sequence_must_be_positive(store: Store) -> None:
-    add_backend(store, tenant_id="acme")
     backend = FakeBackend(static_handler(text_frame(0, "delta", "零")))
     processor = make_processor(store, backend)
 
@@ -440,12 +513,11 @@ async def test_first_frame_sequence_must_be_positive(store: Store) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 11. Illegal frame kinds in a response
+# 5. Illegal frame kinds in a response
 # ---------------------------------------------------------------------------
 
 
 async def test_start_frame_in_response_is_protocol_error(store: Store) -> None:
-    add_backend(store, tenant_id="acme")
     backend = FakeBackend(lambda request: raw_sse_response(sse_body(start_payload())))
     processor = make_processor(store, backend)
 
@@ -457,7 +529,6 @@ async def test_start_frame_in_response_is_protocol_error(store: Store) -> None:
 
 
 async def test_native_frame_in_response_is_protocol_error(store: Store) -> None:
-    add_backend(store, tenant_id="acme")
     native = frame(1, "native", native={"op": "feishu.card", "payload": {}})
     backend = FakeBackend(static_handler(native))
     processor = make_processor(store, backend)
@@ -469,12 +540,11 @@ async def test_native_frame_in_response_is_protocol_error(store: Store) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 12. ERROR frame is terminal: no COMPLETED after it
+# 6. ERROR frame is terminal: no COMPLETED after it
 # ---------------------------------------------------------------------------
 
 
 async def test_error_frame_is_terminal_and_not_followed_by_completed(store: Store) -> None:
-    add_backend(store, tenant_id="acme")
     backend = FakeBackend(
         static_handler(
             text_frame(1, "delta", "部分"),
@@ -496,7 +566,7 @@ async def test_error_frame_is_terminal_and_not_followed_by_completed(store: Stor
 
 
 # ---------------------------------------------------------------------------
-# 13. Idempotency keys per channel
+# 7. Idempotency keys per channel
 # ---------------------------------------------------------------------------
 
 
@@ -550,72 +620,11 @@ def test_idempotency_key_treats_blank_platform_id_as_missing() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 14. BackendRouter
-# ---------------------------------------------------------------------------
-
-
-def test_backend_router_prefers_exact_tenant_then_falls_back(store: Store) -> None:
-    add_backend(store, tenant_id="", base_url="http://default.test/", token_ref="default-literal")
-    add_backend(store, tenant_id="acme", base_url="http://acme.test/", token_ref="acme-literal")
-    router = BackendRouter(store, env={})
-
-    assert router.resolve("acme") == BackendSpec(
-        tenant_id="acme",
-        base_url="http://acme.test",
-        token="acme-literal",
-        timeout_ms=3000,
-        enabled=True,
-    )
-    default = router.resolve(None)
-    assert default is not None
-    assert default.tenant_id == ""
-    assert default.base_url == "http://default.test"
-    # Unknown tenant and missing tenant both use the default backend.
-    assert router.resolve("unknown") == default
-
-
-def test_backend_router_expands_env_references(store: Store) -> None:
-    add_backend(store, tenant_id="a", token_ref="${TOKEN_A}")
-    add_backend(store, tenant_id="b", token_ref="$TOKEN_B")
-    router = BackendRouter(store, env={"TOKEN_A": "from-env-a", "TOKEN_B": "from-env-b"})
-
-    assert router.resolve("a").token == "from-env-a"  # type: ignore[union-attr]
-    assert router.resolve("b").token == "from-env-b"  # type: ignore[union-attr]
-
-
-def test_backend_router_missing_env_expands_to_empty_token(store: Store) -> None:
-    add_backend(store, tenant_id="a", token_ref="${NOT_SET}")
-
-    spec = BackendRouter(store, env={}).resolve("a")
-
-    assert spec is not None
-    assert spec.token == ""
-
-
-def test_backend_router_keeps_literal_token(store: Store) -> None:
-    add_backend(store, tenant_id="a", token_ref="literal$token")
-
-    spec = BackendRouter(store, env={"token": "wrong"}).resolve("a")
-
-    assert spec is not None
-    assert spec.token == "literal$token"
-
-
-def test_backend_router_returns_none_for_disabled_backend(store: Store) -> None:
-    add_backend(store, tenant_id="acme", enabled=False)
-    add_backend(store, tenant_id="", enabled=False)
-
-    assert BackendRouter(store, env={}).resolve("acme") is None
-    assert BackendRouter(store, env={}).resolve(None) is None
-
-
-# ---------------------------------------------------------------------------
-# 15. active_turns: visible while the backend request is in flight
+# 8. active_turns: visible while the backend request is in flight
 # ---------------------------------------------------------------------------
 
 
 async def test_active_turns_tracks_in_flight_turn(store: Store) -> None:
-    add_backend(store, tenant_id="acme")
     request_started = asyncio.Event()
     release = asyncio.Event()
 
@@ -642,12 +651,11 @@ async def test_active_turns_tracks_in_flight_turn(store: Store) -> None:
 
 
 # ---------------------------------------------------------------------------
-# 16. subject metadata: ephemeral push fields are stripped, durable kept
+# 9. subject metadata: ephemeral push fields are stripped, durable kept
 # ---------------------------------------------------------------------------
 
 
 async def test_subject_metadata_strips_ephemeral_fields(store: Store) -> None:
-    add_backend(store, tenant_id="acme")
     processor = make_processor(store, FakeBackend(static_handler(frame(1, "completed"))))
     metadata = {
         "msg_id": "m1",
@@ -678,7 +686,6 @@ async def test_subject_metadata_strips_ephemeral_fields(store: Store) -> None:
 
 
 async def test_subject_upsert_preserves_first_seen(store: Store) -> None:
-    add_backend(store, tenant_id="acme")
     store.upsert_subject(
         SubjectRecord(
             channel_id="feishu:acme:sales",
@@ -702,36 +709,48 @@ async def test_subject_upsert_preserves_first_seen(store: Store) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Settings-driven wiring (build_processor)
+# 10. Settings-driven wiring (build_processor)
 # ---------------------------------------------------------------------------
 
 
 async def test_build_processor_merges_error_text_settings(store: Store) -> None:
     store.set_setting("error_texts", {"backend_down": "自定义不可用"})
-    backend = FakeBackend(static_handler(frame(1, "completed")))
-    processor = build_processor(store, http_client_factory=backend.client_factory())
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("down", request=request)
+
+    backend = FakeBackend(handler)
+    processor = build_processor(
+        store,
+        backend=default_spec(),
+        http_client_factory=backend.client_factory(),
+    )
 
     events = await collect(processor, make_message())
 
     assert event_types(events) == [MessageEventType.ERROR]
     assert events[0].error == "自定义不可用"
-    assert backend.calls == []
 
 
-async def test_build_processor_uses_default_deadline_setting(store: Store) -> None:
-    store.set_setting("turn_deadline_ms", 4321)
-    add_backend(store, tenant_id="acme", timeout_ms=0)
+async def test_build_processor_uses_env_backend(
+    store: Store, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("IMGW_BACKEND_URL", "http://env.test/")
+    monkeypatch.setenv("IMGW_BACKEND_TOKEN", "env-token")
+    monkeypatch.setenv("IMGW_BACKEND_TIMEOUT_MS", "4321")
     backend = FakeBackend(static_handler(frame(1, "completed")))
     processor = build_processor(store, http_client_factory=backend.client_factory())
 
     await collect(processor, make_message())
 
-    body = json.loads(backend.calls[0].content)
-    assert body["deadline_ms"] == 4321
+    request = backend.calls[0]
+    assert str(request.url) == "http://env.test/v1/turns"
+    assert request.headers["authorization"] == "Bearer env-token"
+    assert json.loads(request.content)["deadline_ms"] == 4321
 
 
 # ---------------------------------------------------------------------------
-# Message-level behaviour and parser details
+# 11. Message-level behaviour and parser details
 # ---------------------------------------------------------------------------
 
 
@@ -755,7 +774,6 @@ async def test_missing_channel_subject_yields_error(store: Store) -> None:
 
 
 async def test_message_frame_is_forwarded_and_persisted(store: Store) -> None:
-    add_backend(store, tenant_id="acme")
     backend = FakeBackend(
         static_handler(
             text_frame(1, "delta", "先说的"),
@@ -779,7 +797,6 @@ async def test_message_frame_is_forwarded_and_persisted(store: Store) -> None:
 
 
 async def test_flush_persists_accumulated_delta_and_resets(store: Store) -> None:
-    add_backend(store, tenant_id="acme")
     backend = FakeBackend(
         static_handler(
             text_frame(1, "delta", "第一段"),
@@ -805,7 +822,6 @@ async def test_flush_persists_accumulated_delta_and_resets(store: Store) -> None
 
 
 async def test_sse_parser_ignores_comments_and_joins_multiline_data(store: Store) -> None:
-    add_backend(store, tenant_id="acme")
     delta = text_frame(1, "delta", "多行")
     completed = frame(2, "completed")
     body = ": heartbeat\n\n"
@@ -824,7 +840,6 @@ async def test_sse_parser_ignores_comments_and_joins_multiline_data(store: Store
 
 
 async def test_cancellation_propagates(store: Store) -> None:
-    add_backend(store, tenant_id="acme", timeout_ms=5000)
     entered = asyncio.Event()
 
     async def handler(request: httpx.Request) -> httpx.Response:
@@ -832,7 +847,7 @@ async def test_cancellation_propagates(store: Store) -> None:
         await asyncio.sleep(10)
         return sse_response(frame(1, "completed"))
 
-    processor = make_processor(store, FakeBackend(handler))
+    processor = make_processor(store, FakeBackend(handler), spec=default_spec(timeout_ms=5000))
     message = make_message()
 
     async def consume() -> None:
@@ -848,7 +863,6 @@ async def test_cancellation_propagates(store: Store) -> None:
 
 
 async def test_early_close_releases_in_flight_turn(store: Store) -> None:
-    add_backend(store, tenant_id="acme", timeout_ms=5000)
     backend = FakeBackend(
         static_handler(text_frame(1, "delta", "一"), frame(2, "completed"))
     )
@@ -859,7 +873,7 @@ async def test_early_close_releases_in_flight_turn(store: Store) -> None:
         clients.append(client)
         return client
 
-    processor = TurnProcessor(store, BackendRouter(store), http_client_factory=factory)
+    processor = TurnProcessor(store, default_spec(timeout_ms=5000), http_client_factory=factory)
     stream = processor(make_message())
 
     first = await asyncio.wait_for(stream.__anext__(), timeout=2)
@@ -877,7 +891,6 @@ async def test_early_close_releases_in_flight_turn(store: Store) -> None:
 
 
 async def test_clock_is_injectable(store: Store) -> None:
-    add_backend(store, tenant_id="acme")
     backend = FakeBackend(
         static_handler(text_frame(1, "delta", "答案"), frame(2, "completed"))
     )
@@ -890,6 +903,7 @@ async def test_clock_is_injectable(store: Store) -> None:
     assert rows[0].ts == 5555.0
     assert rows[1].ts == 1000.0
 
+
 async def test_non_json_metadata_objects_are_sanitized(store: Store) -> None:
     """Platform SDK objects in metadata must not break the wire body or SQLite.
 
@@ -897,7 +911,6 @@ async def test_non_json_metadata_objects_are_sanitized(store: Store) -> None:
     into ``InboundMessage.metadata`` (see upstream ``channels/wecom.py``);
     serialising them would turn a normal turn into ``backend_error``.
     """
-    add_backend(store, tenant_id="acme")
     backend = FakeBackend(static_handler(frame(1, "completed")))
     processor = make_processor(store, backend)
 
@@ -924,13 +937,15 @@ async def test_non_json_metadata_objects_are_sanitized(store: Store) -> None:
 
 
 async def test_empty_backend_token_omits_authorization_header(store: Store) -> None:
-    """A missing/empty token must not produce an illegal ``Bearer `` header."""
-    add_backend(store, tenant_id="acme", token_ref="")
+    """An unset ``IMGW_BACKEND_TOKEN`` must not produce an illegal ``Bearer `` header."""
     backend = FakeBackend(static_handler(frame(1, "completed")))
-    processor = build_processor(store, http_client_factory=backend.client_factory())
+    processor = make_processor(
+        store,
+        backend,
+        spec=BackendSpec(base_url=BASE_URL, token="", timeout_ms=3000),
+    )
 
     events = await collect(processor, make_message())
 
     assert event_types(events) == [MessageEventType.COMPLETED]
-    request = backend.calls[0]
-    assert "authorization" not in request.headers
+    assert "authorization" not in backend.calls[0].headers

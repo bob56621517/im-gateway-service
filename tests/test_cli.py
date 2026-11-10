@@ -24,9 +24,8 @@ from im_gateway.cli import qr as qr_module
 runner = CliRunner()
 
 VALID_CONFIG = {
-    "version": 1,
+    "version": 2,
     "channels": [],
-    "backends": [],
     "settings": {},
 }
 
@@ -105,7 +104,6 @@ def channel_view(channel_id: str = "feishu:acme:sales", **overrides: Any) -> dic
     view: dict[str, Any] = {
         "channel_id": channel_id,
         "kind": "feishu",
-        "tenant_id": "",
         "alias": None,
         "name": "",
         "enabled": True,
@@ -251,8 +249,8 @@ def test_status_human_output(backend: FakeBackend) -> None:
             "uptime_s": 65.0,
             "db_path": "/tmp/runtime.db",
             "media_dir": "/tmp/media",
+            "backend_url": "http://127.0.0.1:8080",
             "channels": [channel_view()],
-            "backends": 1,
             "counts": {"channels": 1, "messages": 4, "subjects": 2},
         },
     )
@@ -261,6 +259,7 @@ def test_status_human_output(backend: FakeBackend) -> None:
     assert "feishu:acme:sales" in result.stdout
     assert "0.1.0" in result.stdout
     assert "1m 5s" in result.stdout
+    assert "backend_url     http://127.0.0.1:8080" in result.stdout
 
 
 def test_status_json_output(backend: FakeBackend) -> None:
@@ -273,8 +272,8 @@ def test_status_json_output(backend: FakeBackend) -> None:
             "uptime_s": 1.0,
             "db_path": "/tmp/runtime.db",
             "media_dir": "/tmp/media",
+            "backend_url": "http://127.0.0.1:8080",
             "channels": [channel_view()],
-            "backends": 1,
             "counts": {"channels": 1},
         },
     )
@@ -282,6 +281,7 @@ def test_status_json_output(backend: FakeBackend) -> None:
     assert result.exit_code == 0, result.stderr
     payload = json.loads(result.stdout)
     assert payload["service_version"] == "0.1.0"
+    assert payload["backend_url"] == "http://127.0.0.1:8080"
     assert payload["channels"][0]["channel_id"] == "feishu:acme:sales"
 
 
@@ -785,7 +785,7 @@ def test_config_validate_rejects_invalid_json(tmp_path: Path) -> None:
     assert "invalid config document" in result.stderr
 
 
-def test_config_validate_rejects_semantically_invalid_document(tmp_path: Path) -> None:
+def test_config_validate_rejects_removed_v1_document(tmp_path: Path) -> None:
     path = write_config(
         tmp_path,
         {
@@ -798,6 +798,7 @@ def test_config_validate_rejects_semantically_invalid_document(tmp_path: Path) -
     result = runner.invoke(cli.app, ["config", "validate", str(path)])
     assert result.exit_code == 1
     assert "invalid config document" in result.stderr
+    assert "tenant/backends" in result.stderr
 
 
 def test_config_export_stdout(backend: FakeBackend) -> None:
@@ -826,12 +827,13 @@ def test_config_export_to_file(backend: FakeBackend, tmp_path: Path) -> None:
 
 
 def test_config_import_posts_document(backend: FakeBackend, tmp_path: Path) -> None:
-    backend.route("POST", "/v1/config/import", {"applied": {"channels": 0, "backends": 0, "settings": 0}})
+    backend.route("POST", "/v1/config/import", {"applied": {"channels": 0, "settings": 0}})
     path = write_config(tmp_path, VALID_CONFIG)
     result = runner.invoke(cli.app, ["config", "import", str(path)])
     assert result.exit_code == 0, result.stderr
     body = json.loads(backend.recorded("POST", "/v1/config/import").content)
-    assert body["version"] == 1
+    assert body["version"] == 2
+    assert "backends" not in body
     assert "channels=0" in result.stdout
 
 

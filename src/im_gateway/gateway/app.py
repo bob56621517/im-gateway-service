@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import platform
 import re
 import secrets
@@ -32,12 +33,13 @@ from typing import Any, Final
 
 from fastapi import FastAPI, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from im_gateway import __version__
 from im_gateway.core import paths
 from im_gateway.core.capabilities import capabilities_for
 from im_gateway.core.config import (
+    DOCUMENT_VERSION,
     MASKED_SECRET,
     ChannelConfigEntry,
     ConfigDocument,
@@ -47,7 +49,7 @@ from im_gateway.db.models import ChannelRecord, MessageRecord
 from im_gateway.db.store import Store
 from im_gateway.gateway.login import SUPPORTED_LOGIN_KINDS, LoginManager
 from im_gateway.gateway.maintenance import RetentionScheduler
-from im_gateway.gateway.processor import BackendSpec
+from im_gateway.gateway.processor import BackendSpec, resolve_backend_spec
 from im_gateway.gateway.runtime import GatewayRuntime
 
 __all__ = ["create_app", "run_daemon"]
@@ -73,10 +75,11 @@ _MAX_HISTORY_LIMIT: Final[int] = 1000
 
 
 class ChannelUpdate(BaseModel):
-    """Partial update for ``PATCH /v1/channels/{ref}``."""
+    """Partial update for ``PATCH /v1/channels/{ref}`` (``tenant_id`` is gone)."""
+
+    model_config = ConfigDict(extra="forbid")
 
     kind: str | None = None
-    tenant_id: str | None = None
     alias: str | None = None
     name: str | None = None
     enabled: bool | None = None
@@ -103,6 +106,36 @@ class MaintenanceRequest(BaseModel):
     """Body of ``POST /v1/db/maintenance``."""
 
     action: str
+
+
+class LoginStart(BaseModel):
+    """Optional body of ``POST /v1/channels/{ref}/login``.
+
+    ``timeout_s`` is the caller's overall wait budget (CLI ``--timeout``).  The
+    daemon forwards it to adapters whose platform supports a wait knob; the
+    login session itself has no expiry unless ``IMGW_LOGIN_SESSION_TTL`` is set.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    timeout_s: float | None = Field(default=None, gt=0)
+
+
+def _login_session_ttl_s() -> float | None:
+    """Optional daemon-side session cap (``IMGW_LOGIN_SESSION_TTL``, seconds).
+
+    Unset / malformed / non-positive means "no daemon-side expiry": the platform
+    QR TTL and the CLI wait bound the login attempt instead.
+    """
+    raw = os.environ.get("IMGW_LOGIN_SESSION_TTL", "").strip()
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        logger.warning("ignoring invalid IMGW_LOGIN_SESSION_TTL=%r", raw)
+        return None
+    return value if value > 0 else None
 
 
 # ---------------------------------------------------------------------------
@@ -136,7 +169,6 @@ def _channel_view(
     view: dict[str, Any] = {
         "channel_id": record.channel_id,
         "kind": record.kind,
-        "tenant_id": record.tenant_id,
         "alias": record.alias,
         "name": record.name,
         "enabled": record.enabled,
@@ -186,14 +218,13 @@ def _mask_secrets(value: Any) -> Any:
 
 
 def _export_document(store: Store, *, with_secrets: bool) -> dict[str, Any]:
-    """Build the portable config document (HANDOVER §13.4)."""
+    """Build the portable config document (HANDOVER §13.4, version 2)."""
     document: dict[str, Any] = {
-        "version": 1,
+        "version": DOCUMENT_VERSION,
         "channels": [
             {
                 "channel_id": record.channel_id,
                 "kind": record.kind,
-                "tenant_id": record.tenant_id,
                 "alias": record.alias,
                 "name": record.name,
                 "enabled": record.enabled,
@@ -201,16 +232,6 @@ def _export_document(store: Store, *, with_secrets: bool) -> dict[str, Any]:
                 "constraints": dict(record.constraints),
             }
             for record in store.list_channels()
-        ],
-        "backends": [
-            {
-                "tenant_id": backend.tenant_id,
-                "base_url": backend.base_url,
-                "token_ref": backend.token_ref,
-                "timeout_ms": backend.timeout_ms,
-                "enabled": backend.enabled,
-            }
-            for backend in store.list_backends()
         ],
         "settings": store.get_settings(),
     }
@@ -311,21 +332,22 @@ def create_app(
     runtime: GatewayRuntime | None = None,
     token: str,
     manager: Any | None = None,
-    dev_backend: BackendSpec | None = None,
+    backend: BackendSpec | None = None,
 ) -> FastAPI:
     """Build the control-plane ASGI app.
 
     ``runtime`` may be injected (tests / embedding); otherwise one is built
     around ``store``.  ``manager`` is only used when the runtime is built here,
-    which is how tests inject a fake upstream manager.
+    which is how tests inject a fake upstream manager.  ``backend`` is the single
+    backend URL/token/timeout (default: resolved from the environment).
     """
     active_runtime = (
         runtime
         if runtime is not None
-        else GatewayRuntime(store, token=token, manager=manager, dev_backend=dev_backend)
+        else GatewayRuntime(store, token=token, manager=manager, backend=backend)
     )
     scheduler = RetentionScheduler(store)
-    login_manager = LoginManager(active_runtime)
+    login_manager = LoginManager(active_runtime, session_ttl_s=_login_session_ttl_s())
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
@@ -392,7 +414,6 @@ def create_app(
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
-
     @app.get("/readyz")
     async def readyz() -> Any:
         try:
@@ -432,8 +453,8 @@ def create_app(
             "uptime_s": round(active_runtime.uptime_s, 3),
             "db_path": active_runtime.db_path,
             "media_dir": str(active_runtime.media_dir),
+            "backend_url": active_runtime.backend_url,
             "channels": [_channel_view(active_runtime, record) for record in store.list_channels()],
-            "backends": len(store.list_backends()),
             "counts": {
                 "channels": counts.get("channels", 0),
                 "messages": counts.get("messages", 0),
@@ -494,8 +515,9 @@ def create_app(
 
     # -- QR login (feishu / wecom / dingtalk / qq / weixin; HANDOVER §13.7) ---
     @app.post("/v1/channels/{ref}/login")
-    async def start_login(ref: str) -> dict[str, Any]:
-        return await login_manager.begin(ref)
+    async def start_login(ref: str, payload: LoginStart | None = None) -> dict[str, Any]:
+        timeout_s = None if payload is None else payload.timeout_s
+        return await login_manager.begin(ref, timeout_s=timeout_s)
 
     @app.get("/v1/channels/{ref}/login/{session_id}")
     async def poll_login(ref: str, session_id: str) -> dict[str, Any]:
@@ -612,16 +634,19 @@ def run_daemon(
     port: int | None = None,
     listen: str | None = None,
     db: str | None = None,
+    backend_url: str | None = None,
     dev_backend: bool = False,
     dev_backend_port: int = 9900,
 ) -> None:
     """Run the control plane in the foreground (``imgw run``).
 
-    With ``dev_backend=True`` an in-process echo backend (``im_gateway.dev``)
-    is started on ``127.0.0.1:{dev_backend_port}`` and **every tenant** is routed
-    to it instead of the ``backends`` table, so channel connectivity can be
-    debugged without writing any backend config.
+    ``backend_url`` is the single agent backend (CLI flag, then
+    ``IMGW_BACKEND_URL``, then the default).  With ``dev_backend=True`` an
+    in-process echo backend (``im_gateway.dev``) is started on
+    ``127.0.0.1:{dev_backend_port}`` and the global backend URL is pointed at it
+    (other mechanisms — token, timeout, persistence — are unchanged).
     """
+    import dataclasses
     import threading
     import time
 
@@ -630,9 +655,9 @@ def run_daemon(
     token = paths.load_or_create_token()
     db_path = Path(db) if db is not None else paths.default_db_path()
     store = Store(db_path)
+    backend = resolve_backend_spec(backend_url=backend_url)
 
     dev_server: Any | None = None
-    dev_spec: BackendSpec | None = None
     if dev_backend:
         from im_gateway.dev.backend import create_dev_backend_app
 
@@ -655,19 +680,15 @@ def run_daemon(
             time.sleep(0.05)
         if not dev_server.started:
             raise RuntimeError(f"dev backend did not start on 127.0.0.1:{dev_backend_port}")
-        dev_spec = BackendSpec(
-            tenant_id="",
-            base_url=f"http://127.0.0.1:{int(dev_backend_port)}",
-            token="",
-            timeout_ms=120_000,
-            enabled=True,
+        backend = dataclasses.replace(
+            backend, base_url=f"http://127.0.0.1:{int(dev_backend_port)}"
         )
         logger.info(
-            "dev backend listening on http://127.0.0.1:%s (all tenants routed here)",
+            "dev backend listening on http://127.0.0.1:%s (global backend URL overridden)",
             dev_backend_port,
         )
 
-    app = create_app(store=store, token=token, dev_backend=dev_spec)
+    app = create_app(store=store, token=token, backend=backend)
     address = _parse_listen_address(listen=listen, host=host, port=port)
     try:
         if address.uds is not None:
