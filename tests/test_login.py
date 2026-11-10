@@ -358,7 +358,7 @@ async def test_qq_adapter_maps_upstream_results() -> None:
     login.credentials = [type("Cred", (), {"app_id": "app", "app_secret": "sec"})()]
     result = await adapter.poll()
     assert result.status == "success"
-    assert result.config_updates == {"app_id": "app", "app_secret": "sec"}
+    assert result.config_updates == {"app_id": "app", "secret": "sec"}
 
     login.poll_status = "expired"
     assert (await adapter.poll()).status == "expired"
@@ -746,6 +746,32 @@ async def test_dingtalk_adapter_happy_path() -> None:
     assert result.status == "success"
     assert result.config_updates == {"app_key": "ding-id", "app_secret": "ding-sec"}
     assert (await adapter.poll()).status == "expired"  # device code cleared
+
+
+async def test_dingtalk_adapter_tolerates_provisioning_statuses() -> None:
+    """Live API: WAITING → CREATING → PUBLISHING → SUCCESS (or APPROVING)."""
+    post = _dingtalk_post()
+    adapter = DingTalkLoginAdapter(post=post, clock=lambda: 0.0)
+    await adapter.start()
+
+    for status in ("SCANNED", "CREATING", "PUBLISHING"):
+        post.queue("/app/registration/poll", {"status": status})
+        assert (await adapter.poll()).status == "pending"
+
+    post.queue("/app/registration/poll", {"status": "APPROVING"})  # no creds yet
+    assert (await adapter.poll()).status == "pending"
+
+    post.queue("/app/registration/poll", {"status": "SOME_FUTURE_STATE"})
+    assert (await adapter.poll()).status == "pending"
+
+    post.queue(
+        "/app/registration/poll",
+        {"status": "APPROVING", "client_id": "ding-id", "client_secret": "ding-sec"},
+    )
+    result = await adapter.poll()
+    assert result.status == "success"
+    assert result.config_updates == {"app_key": "ding-id", "app_secret": "ding-sec"}
+    assert "审批" in result.message
 
 
 async def test_dingtalk_adapter_expired_and_failures() -> None:

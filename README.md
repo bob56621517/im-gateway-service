@@ -15,11 +15,11 @@
 | FastAPI 控制面（healthz/readyz/status/channels/probe/config export-import/history/messages/maintenance/events/login） | ✅ 单元测试覆盖（含 `TestClient`） |
 | 模型 A processor（`POST /v1/turns` + SSE → `MessageEvent`、幂等、subjects/messages 落库、超时/取消/错误映射） | ✅ 用 `httpx.MockTransport` 假后端完整单测 |
 | CLI（17 个顶层命令，`channel`/`config` 含子命令）+ 系统服务生成与 start/stop/restart | ✅ 单元测试覆盖（fake runner） |
-| 扫码/静默建号（`channel login`：飞书 / 企微 / 钉钉 / QQ / 微信 adapter 可注入；登录成功自动启用；`logout` 停用、`delete` 删行需先 logout；`list` secret 脱敏） | ✅ 状态机与 adapter 映射有单测；真实平台流程待真机验证 |
+| 扫码/静默建号（`channel login`：飞书 / 企微 / 钉钉 / QQ / 微信 adapter 可注入；登录成功自动启用；`logout` 停用、`delete` 删行需先 logout；`list` secret 脱敏） | ✅ 状态机与 adapter 单测；微信 / 企微 / QQ / 钉钉真机扫码 + 收发已跑通（飞书待平台策略） |
 | dev-backend 调试套件（`im_gateway.dev.backend` + `imgw run-dev`） | ✅ 单测覆盖（TestClient + CLI 参数） |
 | 真实平台连接与收发、capability 真机校准、outbox 重试 | ⏳ 需要真实凭证/网络，见 HANDOVER §15.3 |
 
-**测试**：`uv run pytest` → 451 passed；`ruff`、`mypy`（strict）干净；`--cov=im_gateway` → 96%（未覆盖分支主要是 5 平台扫码 adapter 的真实网络调用，待真机冒烟覆盖）。
+**测试**：`uv run pytest` → 466 passed；`ruff`、`mypy`（strict）干净；`--cov=im_gateway` → 96%（未覆盖分支主要是 5 平台扫码 adapter 的真实网络调用，待真机冒烟覆盖）。
 测试全部离线（MockTransport / fake manager / fake runner / TestClient），不依赖真实平台或网络。
 
 ## 快速开始

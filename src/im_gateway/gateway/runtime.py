@@ -130,6 +130,23 @@ def _is_structural_change(record: ChannelRecord, fields: dict[str, Any]) -> bool
     return "enabled" in fields and bool(fields["enabled"]) != record.enabled
 
 
+def _json_safe(value: Any) -> Any:
+    """Coerce arbitrary channel metadata to JSON-serializable primitives.
+
+    Some channels (notably WeCom) park live SDK objects such as an open
+    ``WSClient`` inside ``ChannelSubject.metadata``.  Those would make
+    FastAPI's response encoder raise ``Unable to serialize unknown type``,
+    so the control plane degrades them to their ``str()`` form.
+    """
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, dict):
+        return {str(key): _json_safe(item) for key, item in value.items()}
+    if isinstance(value, list | tuple | set | frozenset):
+        return [_json_safe(item) for item in value]
+    return str(value)
+
+
 # ---------------------------------------------------------------------------
 # GatewayRuntime
 # ---------------------------------------------------------------------------
@@ -638,7 +655,7 @@ class GatewayRuntime:
                     "display_name": getattr(live, "display_name", "") or row.display_name,
                     "first_seen": row.first_seen,
                     "last_seen": getattr(live, "last_seen", None) or row.last_seen,
-                    "metadata": dict(getattr(live, "metadata", {}) or row.metadata),
+                    "metadata": _json_safe(dict(getattr(live, "metadata", {}) or row.metadata)),
                 }
             )
         for subject_id, live in memory.items():
@@ -651,7 +668,7 @@ class GatewayRuntime:
                     "display_name": getattr(live, "display_name", ""),
                     "first_seen": getattr(live, "first_seen", None),
                     "last_seen": getattr(live, "last_seen", None),
-                    "metadata": dict(getattr(live, "metadata", {}) or {}),
+                    "metadata": _json_safe(dict(getattr(live, "metadata", {}) or {})),
                 }
             )
         merged.sort(key=lambda item: str(item["subject_id"]))

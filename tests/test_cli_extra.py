@@ -407,6 +407,25 @@ def test_channel_login_silent_json(backend: FakeBackend) -> None:
     assert body["config"] == {"app_id": "cli", "app_secret": "s"}
 
 
+def test_channel_login_silent_qq_maps_secret(backend: FakeBackend) -> None:
+    backend.route("POST", "/v1/channels", {"channel_id": "qq:bot", "state": "disabled"})
+    result = invoke(
+        "--json",
+        "channel",
+        "login",
+        "qq",
+        "--id",
+        "qq:bot",
+        "--app-id",
+        "1024",
+        "--app-secret",
+        "s3cr3t",
+    )
+    assert result.exit_code == 0, result.stderr
+    body = json.loads(backend.recorded("POST", "/v1/channels").content)
+    assert body["config"] == {"app_id": "1024", "secret": "s3cr3t"}
+
+
 def test_channel_logout_json(backend: FakeBackend) -> None:
     backend.route("PATCH", "/v1/channels/sales", {"channel_id": "feishu:acme:sales"})
     result = invoke("--json", "channel", "logout", "sales")

@@ -94,6 +94,22 @@ app.add_typer(subject_app, name="subject")
 app.add_typer(config_app, name="config")
 
 
+def _make_streams_encoding_safe() -> None:
+    """Degrade unencodable characters instead of crashing on legacy consoles.
+
+    Windows terminals often expose a GBK/CP936 stdout; printing a channel reply
+    that contains emoji would otherwise raise ``UnicodeEncodeError`` from deep
+    inside typer.  ``errors="replace"`` keeps the command working and renders
+    the unencodable character as ``?``.
+    """
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            with contextlib.suppress(ValueError, OSError):
+                reconfigure(errors="replace")
+
+
 @app.callback()
 def _root(
     ctx: typer.Context,
@@ -119,6 +135,7 @@ def _root(
     ] = False,
 ) -> None:
     """Global options shared by every command."""
+    _make_streams_encoding_safe()
     ctx.obj = CliOptions(url=url, token=token, json_output=json_output)
 
 
@@ -937,7 +954,9 @@ def _build_login_config(
     if app_id:
         values["app_id"] = app_id
     if app_secret:
-        values["app_secret"] = app_secret
+        # QQ's channel config names the app secret ``secret``; other kinds use
+        # ``app_secret`` (upstream ``QQConfig.required_credentials``).
+        values["secret" if kind == "qq" else "app_secret"] = app_secret
     if bot_id:
         values["bot_id"] = bot_id
     if secret:
@@ -956,9 +975,9 @@ def _build_login_config(
             account["base_url"] = base_url
         values["accounts"] = [account]
     if stdin_secret:
-        if kind == "wecom":
+        if kind in {"wecom", "qq"}:
             values["secret"] = stdin_secret
-        elif kind in {"feishu", "qq", "dingtalk"}:
+        elif kind in {"feishu", "dingtalk"}:
             values["app_secret"] = stdin_secret
         elif kind == "weixin":
             accounts = values.get("accounts")

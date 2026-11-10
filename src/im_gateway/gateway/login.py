@@ -31,7 +31,7 @@ import threading
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Literal, Protocol
+from typing import TYPE_CHECKING, Any, Final, Literal, Protocol
 
 import httpx
 
@@ -123,11 +123,14 @@ class QQLoginAdapter:
             if not credentials:
                 return LoginPoll("expired", message="QQ 登录成功但未返回凭证")
             first = credentials[0]
+            # QQConfig stores the app secret under ``secret`` (see
+            # ``QQConfig.required_credentials == ("app_id", "secret")``), while
+            # the QR payload calls it ``app_secret``.
             return LoginPoll(
                 "success",
                 config_updates={
                     "app_id": str(first.app_id),
-                    "app_secret": str(first.app_secret),
+                    "secret": str(first.app_secret),
                 },
             )
         if status == "pending":
@@ -490,6 +493,24 @@ class WeComLoginAdapter:
 
 _DINGTALK_BASE_URL = "https://oapi.dingtalk.com"
 
+#: Non-terminal poll statuses while DingTalk provisions the app after a scan:
+#: ``WAITING → SCANNED → CREATING → PUBLISHING → SUCCESS`` (or ``APPROVING``
+#: when the organisation requires admin approval).  Unknown statuses are also
+#: treated as pending; only FAIL / EXPIRED / SUCCESS-without-credentials end
+#: the session early.
+_DINGTALK_PENDING_STATUSES: Final = frozenset(
+    {"WAITING", "SCANNED", "CREATING", "PUBLISHING", "APPROVING"}
+)
+
+
+def _first_text(data: dict[str, Any], *names: str) -> str:
+    """Return the first non-empty string value among *names*."""
+    for name in names:
+        value = data.get(name)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
 
 async def _dingtalk_default_post(path: str, payload: dict[str, Any]) -> dict[str, Any]:
     async with httpx.AsyncClient(base_url=_DINGTALK_BASE_URL, timeout=15.0) as client:
@@ -525,6 +546,7 @@ class DingTalkLoginAdapter:
         self._clock = clock
         self._device_code = ""
         self._expires_at: float | None = None
+        self._last_status = ""
 
     async def start(self) -> LoginChallenge:
         post = self._post or _dingtalk_default_post
@@ -556,23 +578,49 @@ class DingTalkLoginAdapter:
             self._clear()
             return LoginPoll("expired", message=f"钉钉扫码登录失败: {exc}")
         status = str(data.get("status") or "").upper()
-        if status == "WAITING":
-            return LoginPoll("pending")
-        if status == "SUCCESS":
+        client_id = _first_text(data, "client_id", "clientId", "app_key", "appKey")
+        client_secret = _first_text(data, "client_secret", "clientSecret", "app_secret", "appSecret")
+        if status != self._last_status:
+            # The daemon only configures uvicorn's loggers, so INFO from this
+            # module is invisible; warn once per state change (never the values).
+            logger.warning(
+                "dingtalk registration poll: status=%r keys=%s has_credentials=%s",
+                status,
+                sorted(data),
+                bool(client_id and client_secret),
+            )
+            self._last_status = status
+        if client_id and client_secret:
+            # DingTalk hands out the app credentials as soon as the app exists,
+            # which can be before the terminal SUCCESS status (APPROVING while
+            # an admin still has to approve).  Keep them either way.
             self._clear()
-            client_id = str(data.get("client_id") or "")
-            client_secret = str(data.get("client_secret") or "")
-            if not client_id or not client_secret:
-                return LoginPoll("expired", message="钉钉扫码登录成功但未返回应用凭证")
+            message = (
+                "应用已创建，等待管理员审批；凭据已保存，审批通过后通道才能收发消息"
+                if status == "APPROVING"
+                else ""
+            )
             return LoginPoll(
                 "success",
                 config_updates={"app_key": client_id, "app_secret": client_secret},
+                message=message,
             )
-        self._clear()
+        if status in _DINGTALK_PENDING_STATUSES or not status:
+            return LoginPoll("pending")
+        if status == "SUCCESS":
+            self._clear()
+            return LoginPoll("expired", message="钉钉扫码登录成功但未返回应用凭证")
         if status == "FAIL":
+            self._clear()
             reason = str(data.get("fail_reason") or data.get("fail_msg") or "")
             return LoginPoll("expired", message=f"钉钉扫码登录失败: {reason or '用户未授权'}")
-        return LoginPoll("expired", message="二维码已过期，请重新登录")
+        if status == "EXPIRED":
+            self._clear()
+            return LoginPoll("expired", message="二维码已过期，请重新登录")
+        # Unknown non-terminal status (e.g. SCANNED while the phone shows the
+        # "bind existing bot / create new" page): keep polling and let the QR
+        # TTL / CLI timeout bound the wait instead of reporting a false expiry.
+        return LoginPoll("pending")
 
     async def cancel(self) -> None:
         self._clear()
@@ -580,6 +628,7 @@ class DingTalkLoginAdapter:
     def _clear(self) -> None:
         self._device_code = ""
         self._expires_at = None
+        self._last_status = ""
 
 
 def default_adapter_factory(kind: str) -> LoginAdapter:

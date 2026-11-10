@@ -564,6 +564,22 @@ async def test_push_all_merges_durable_and_memory_subjects(db_path: Path) -> Non
         }
 
 
+async def test_list_subjects_sanitises_non_json_metadata(db_path: Path) -> None:
+    manager = StubManager()
+    async with running_runtime(db_path, manager=manager) as (runtime, _manager):
+        await runtime.add_channel(make_entry())
+        manager.subjects[CHANNEL_ID] = [
+            # WeCom-style live subject: metadata carries an SDK object.
+            ChannelSubject(subject_id="wecom-user", metadata={"client": object()}),
+        ]
+
+        subjects = runtime.list_subjects(CHANNEL_ID)
+
+        assert subjects[0]["subject_id"] == "wecom-user"
+        assert subjects[0]["metadata"]["client"].startswith("<object object at")
+        json.dumps(subjects)  # must stay JSON-serializable for the HTTP layer
+
+
 async def test_list_subjects_survives_memory_registry_failure(db_path: Path) -> None:
     manager = StubManager()
     manager.fail_list_subjects = True
