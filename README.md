@@ -1,87 +1,74 @@
 # im-gateway-service
 
-把 **octop-gateway**（MIT 的 Python 通道库）包成一层**单进程 IM 网关服务**：一个进程同时承载
-控制面（CLI 用的 HTTP API）与所有 IM 通道连接；后端 agent 在进程外，通过 webhook 流式交互。
+把 **octop-gateway**（MIT 的 Python 通道库）包成一层**单进程 IM 网关服务**：一个 `imgw run` 进程同时承载
+控制面 HTTP API 与所有 IM 通道连接；agent 后端在进程外，通过 webhook + SSE 流式交互。
 
-命令行的完整参考与命令变更记录见 [docs/CLI.md](docs/CLI.md)；设计与全部决策记录见 [HANDOVER.md](HANDOVER.md)（重点：§12 线上契约、§13 状态/存储/API、§14 决策定稿、§15 实施状态）。
-当前开发与真机验证进度见 [docs/PROGRESS.md](docs/PROGRESS.md)。
+> **用法文档就是帮助输出**：先 `uv run imgw --help`，再看 `uv run imgw <command> --help`（完整参数 + 可复制示例）。
+> 帮助与错误文案支持中英双语（默认英文，系统区域为中文时自动中文；`IMGW_LANG=zh|en` 显式切换）。
+> 破坏性变更/迁移历史见 [docs/CLI.md](docs/CLI.md)；设计定稿见 [HANDOVER.md](HANDOVER.md)；真机验证进度见 [docs/PROGRESS.md](docs/PROGRESS.md)。
 
-## 当前状态
+## 架构
 
-| 能力 | 状态 |
-|---|---|
-| 线上契约 `TurnFrame`（11 种帧 + 逐帧校验 + 上游互转 + metadata 清洗） | ✅ 单元测试覆盖 |
-| SQLite（9 张表：配置 + 运行数据）/ Store / 迁移 / 备份 / retention 调度 | ✅ 单元测试覆盖 |
-| FastAPI 控制面（healthz/readyz/status/channels/probe/config export-import/history/messages/maintenance/events/login） | ✅ 单元测试覆盖（含 `TestClient`） |
-| 模型 A processor（`POST /v1/turns` + SSE → `MessageEvent`、幂等、subjects/messages 落库、超时/取消/错误映射） | ✅ 用 `httpx.MockTransport` 假后端完整单测 |
-| CLI（17 个顶层命令，`channel`/`config` 含子命令）+ 系统服务生成与 start/stop/restart | ✅ 单元测试覆盖（fake runner） |
-| 扫码/静默建号（`channel login`：飞书 / 企微 / 钉钉 / QQ / 微信 adapter 可注入；登录成功自动启用；`logout` 停用、`delete` 删行需先 logout；`list` secret 脱敏） | ✅ 状态机与 adapter 单测；微信 / 企微 / QQ / 钉钉真机扫码 + 收发已跑通（飞书待平台策略） |
-| dev-backend 调试套件（`im_gateway.dev.backend` + `imgw run-dev`） | ✅ 单测覆盖（TestClient + CLI 参数） |
-| 真实平台连接与收发、capability 真机校准、outbox 重试 | ⏳ 需要真实凭证/网络，见 HANDOVER §15.3 |
+```text
+ IM 平台 (飞书/企微/钉钉/QQ/微信)
+      │  WebSocket / 回调 / 长轮询
+      ▼
+┌────────────────────── imgw run（单进程 daemon）──────────────────────┐
+│  channel 适配器（octop-gateway）→ processor（模型 A）→ 后端 agent    │
+│        │                              ▲                      │       │
+│        │ 入站消息                      │ TurnFrame(SSE)        │ 回复  │
+│        ▼                              │                      ▼       │
+│  SQLite（配置/历史/审计）+ 控制面 HTTP API ←── CLI `imgw ...`（纯 client）│
+└──────────────────────────────────────────────────────────────────────┘
+```
 
-**测试**：`uv run pytest` → 466 passed；`ruff`、`mypy`（strict）干净；`--cov=im_gateway` → 96%（未覆盖分支主要是 5 平台扫码 adapter 的真实网络调用，待真机冒烟覆盖）。
-测试全部离线（MockTransport / fake manager / fake runner / TestClient），不依赖真实平台或网络。
+- **模型 A**：入站消息 → `POST {backend}/v1/turns`（SSE 返回统一 `TurnFrame`）→ 帧转成通道回复，终态必为 `completed` / `error`；
+- **多租户**：通道按 `tenant_id` 路由到不同后端；`imgw run-dev` 时所有 tenant 被内存覆盖到内置回显后端；
+- **CLI 是纯 HTTP 客户端**：不直接碰数据库，所有写操作经控制面；secret 在视图中一律脱敏。
 
 ## 快速开始
 
 ```bash
-uv sync --all-groups           # 依赖（octop-gateway==1.0.3 等）
-uv run imgw run                # 前台启动 daemon（唯一启动进程的命令）
-uv run imgw status             # 另开终端；默认 tcp://127.0.0.1:8765
-```
+uv sync --all-groups                     # 安装依赖（octop-gateway==1.0.3 等）
+uv run imgw --help                       # 权威用法文档（每个子命令同样支持 --help）
 
-Windows 默认监听 `127.0.0.1:8765`；POSIX 默认 UDS `$XDG_RUNTIME_DIR/imgw.sock`。
-控制面 token 首次启动自动生成（POSIX `~/.config/im-gateway/token`，Windows `%APPDATA%`），CLI 自动读取。
-
-```bash
+uv run imgw run                          # 前台启动 daemon（唯一启动进程的命令）
+# 另开终端：
+uv run imgw status                       # 默认 tcp://127.0.0.1:8765；token 自动生成/读取
 uv run imgw channel login feishu --name sales   # 扫码建号（飞书/企微/钉钉/QQ/微信）
-uv run imgw channel login feishu --id feishu:acme:sales --name sales \
-  --app-id cli_x --app-secret '${FEISHU_APP_SECRET}'   # 静默凭据（不扫码）
-uv run imgw channel list                        # TSV，可 grep；--json / --header
-uv run imgw channel list feishu:acme:sales      # 详情；config 中 secret 一律 ***
-uv run imgw channel logout feishu:acme:sales    # 停用（保留凭据与历史）
-uv run imgw channel delete feishu:acme:sales --yes   # 删除（须先 logout；--purge 级联数据）
-uv run imgw config export -o cfg.json    # 默认脱敏（字面 secret -> "***"，${ENV} 保留）
-uv run imgw config import cfg.json
-uv run imgw send sales ou_xxx "hello"    # 主动推送（带 Idempotency-Key）
-uv run imgw history --limit 20
-uv run imgw doctor
+uv run imgw channel list                 # TSV（--json / --header）
+uv run imgw send sales ou_xxx "hello"    # 主动推送
+uv run imgw history --limit 20           # 入站/出站记录
+uv run imgw doctor                       # 自检
 ```
 
-开发调试（不需要真实后端）：
+不接真实后端时用开发模式（内置回显后端，验证网关 ↔ 通道连通性）：
 
 ```bash
-uv run imgw run-dev                  # 开发模式：内置回显后端，自动接管所有 tenant
-uv run python -m im_gateway.dev.backend --port 9900   # 或独立跑调试套件
+uv run imgw run-dev                      # 回显后端默认 127.0.0.1:9900（--dev-backend-port 可改）
 ```
 
-`imgw run-dev` 会在 `127.0.0.1:9900`（`--dev-backend-port` 可改）起一个回显后端（源码 `im_gateway.dev.backend`），把任何入站消息一次性回成包含 `channel / kind / tenant / subject_id / subject_name / chat_type / session_key / turn_id / idempotency_key / message` 的固定文本，便于验证网关 ↔ 通道连通性，无需写 webhook。
-
-bootstrap 只有三项，全部可用环境变量/参数覆盖：`IMGW_DB`、`IMGW_LISTEN`、`IMGW_TOKEN_FILE`。
-其余配置与运行数据都在 SQLite（`IMGW_DATA_DIR` 下的 `runtime.db`）。
-
-作为系统服务：`imgw install-service`（默认用户级 systemd / launchd / NSSM，`--system` 需 root；`--print-only` 只生成）。
-Windows/无 systemd 环境不支持时给出可读错误并 exit 1。
+系统服务：`uv run imgw install-service`（默认用户级 systemd / launchd / NSSM；`--system` 需 root；`--print-only` 只生成）。
 
 ## 目录
 
-```
+```text
 src/im_gateway/
 ├── core/       contracts.py（TurnFrame）· config.py · capabilities.py · paths.py
 ├── db/         schema.py · models.py · store.py
-├── gateway/    app.py（create_app/run_daemon）· runtime.py · factory.py · events.py
-│               processor.py（模型 A）· idempotency.py · maintenance.py · login.py
-└── cli/        main.py（typer）· client.py（httpx）· qr.py（segno）· service.py
-tests/          契约 / 配置 / DB / 控制面 / processor / 登录 / service / CLI / 生命周期
+├── gateway/    app.py（create_app/run_daemon）· runtime.py · factory.py · processor.py
+│               login.py（5 平台扫码）· idempotency.py · maintenance.py · events.py
+├── dev/        backend.py（回显后端，仅供 run-dev）
+└── cli/        main.py（typer）· i18n.py · client.py · qr.py · service.py
+tests/          契约 / 配置 / DB / 控制面 / processor / 登录 / i18n / CLI
 ```
 
 ## 开发门禁
 
 ```bash
-uv run pytest -q
-uv run pytest -q --cov=im_gateway --cov-report=term-missing
+uv run pytest -q                         # 513 passed
 uv run ruff check src tests
-uv run mypy
+uv run mypy src
 ```
 
 ## 许可证

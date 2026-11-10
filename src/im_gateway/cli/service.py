@@ -33,6 +33,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from im_gateway.cli.i18n import t
 from im_gateway.core import paths
 
 __all__ = [
@@ -88,9 +89,13 @@ class ServiceError(RuntimeError):
         """Render a failed system command (including its stderr) for the CLI."""
         command = _command_argv(exc.cmd)
         stderr = _decode_stream(exc.stderr).strip()
-        message = f"`{render_command(command)}` failed with exit code {exc.returncode}"
+        message = t(
+            "`{command}` failed with exit code {code}",
+            command=render_command(command),
+            code=exc.returncode,
+        )
         if stderr:
-            message = f"{message}: {stderr}"
+            message = t("{message}: {stderr}", message=message, stderr=stderr)
         return cls(message, command=command, stderr=stderr)
 
 
@@ -332,7 +337,13 @@ class ServiceController:
         try:
             write_service_file(self.spec, platform=self.platform, target=resolved)
         except OSError as exc:
-            raise ServiceError(f"cannot write the service definition under {resolved}: {exc}") from exc
+            raise ServiceError(
+                t(
+                    "cannot write the service definition under {target}: {error}",
+                    target=resolved,
+                    error=exc,
+                )
+            ) from exc
         self._execute(commands)
         return commands
 
@@ -444,7 +455,11 @@ class ServiceController:
                 raise ServiceError.from_called_process_error(exc) from exc
             except OSError as exc:
                 raise ServiceError(
-                    f"cannot run `{render_command(command)}`: {exc}",
+                    t(
+                        "cannot run `{command}`: {error}",
+                        command=render_command(command),
+                        error=exc,
+                    ),
                     command=command,
                 ) from exc
 
@@ -463,10 +478,14 @@ def _remove(path: Path) -> None:
     try:
         path.unlink(missing_ok=True)
     except OSError as exc:
-        raise ServiceError(f"cannot remove {path}: {exc}") from exc
+        raise ServiceError(t("cannot remove {path}: {error}", path=path, error=exc)) from exc
 
 
 def _unsupported_platform(platform: str) -> ServiceError:
     return ServiceError(
-        f"unsupported platform {platform!r}: service management supports linux, darwin and win32"
+        t(
+            "unsupported platform {platform!r}: service management supports linux, "
+            "darwin and win32",
+            platform=platform,
+        )
     )

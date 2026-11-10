@@ -467,7 +467,7 @@ def test_channel_test_json(backend: FakeBackend) -> None:
 def test_channel_login_timeout_must_be_positive(backend: FakeBackend) -> None:
     result = invoke("channel", "login", "sales", "--timeout", "0")
     assert result.exit_code == 1
-    assert "必须为正数" in result.stderr
+    assert "--timeout must be a positive number" in result.stderr
 
 
 def _login_routes(backend: FakeBackend, *, final_state: str = "running") -> None:

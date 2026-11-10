@@ -7,6 +7,12 @@ HTTP API. SQLite is never touched directly (the daemon is the only writer).
 Hard rule: this module must not import ``im_gateway.gateway.*`` or
 ``im_gateway.db.*``. The single allowed gateway import is the lazy one inside
 :func:`run`.
+
+User-facing prose goes through :func:`im_gateway.cli.i18n.t`.  The English
+string is the message id, so ``--help`` text is written in English here and the
+Chinese translation lives in the catalog in ``i18n.py``.  Machine-readable
+output (JSON keys, TSV headers, ids, ``sent to ...`` / ``deleted: ...`` lines,
+exit codes, masking) stays English in both languages.
 """
 
 from __future__ import annotations
@@ -30,6 +36,7 @@ import typer
 
 from im_gateway.cli import client as control_plane
 from im_gateway.cli.client import ControlPlaneError
+from im_gateway.cli.i18n import t
 from im_gateway.cli.service import (
     ServiceController,
     ServiceError,
@@ -63,30 +70,131 @@ class CliOptions:
     json_output: bool = False
 
 
+#: ``rich_markup_mode=None`` keeps Click's plain help formatter.  That formatter
+#: honours the ``\b`` no-wrap paragraphs used for copy-pasteable examples; Rich
+#: would re-wrap them (and would also parse ``[...]`` in prose as markup).
 app = typer.Typer(
     name="imgw",
-    help=(
-        "im-gateway control CLI.\n\n"
-        "Every command except `imgw run` is an HTTP client for the daemon's "
-        "control plane; it never touches the database directly."
+    help=t(
+        "im-gateway control CLI: manage one im-gateway daemon, its channels, "
+        "configuration and message history.\n"
+        "\n"
+        "Only `imgw run` and `imgw run-dev` start a process; every other command is "
+        "an HTTP client for the daemon's control-plane API and never reads or writes "
+        "the SQLite database directly.\n"
+        "\n"
+        "Output contract: data goes to stdout; progress, warnings and errors go to "
+        "stderr. Run `imgw <command> --help` for per-command options and "
+        "copy-pasteable examples."
     ),
+    epilog=t(
+        "Quick start:\n"
+        "\n"
+        "\b\n"
+        "$ imgw run                                 # terminal 1: start the daemon\n"
+        "$ imgw status                              # terminal 2: daemon + channel state\n"
+        "$ imgw channel login feishu --name sales   # QR-code bind (5 platforms)\n"
+        "$ imgw channel list                        # TSV: channel_id kind state creds alias\n"
+        "$ imgw send sales ou_xxx 'hello'           # push one message\n"
+        "\n"
+        "Command groups:\n"
+        "\n"
+        "\b\n"
+        "channel   login | logout | list | delete | test   bind and manage channel instances\n"
+        "subject   ls                                      inspect known push targets\n"
+        "config    export | import | validate              portable config document\n"
+        "\n"
+        "Environment variables:\n"
+        "\n"
+        "\b\n"
+        "IMGW_URL         control-plane URL (http(s)://host:port or unix:///path/to.sock)\n"
+        "IMGW_TOKEN       control-plane bearer token\n"
+        "IMGW_TOKEN_FILE  file holding the bearer token (created by `imgw run`)\n"
+        "IMGW_LANG        help/error language: en (default) or zh (zh_CN, zh-TW, GBK/936)\n"
+        "\n"
+        "Exit codes:\n"
+        "\n"
+        "\b\n"
+        "0  success\n"
+        "1  command failed (unreachable daemon, HTTP error, timeout, not ready)\n"
+        "2  invalid command-line usage (reported by the CLI framework)\n"
+        "\n"
+        "Language:\n"
+        "\n"
+        "\b\n"
+        "CLI help and progress/error text are English by default. They switch to\n"
+        "Chinese when the OS locale is Chinese or IMGW_LANG=zh (zh_CN / zh-TW / GBK /\n"
+        "936 are accepted; anything else means English). Machine-readable output --\n"
+        "JSON keys, TSV headers, channel/subject ids, `sent to ...` and `deleted: ...`\n"
+        "lines, masking (***), timestamps and exit codes -- stays English in both\n"
+        "languages. Daemon-side error details are still Chinese for now."
+    ),
+    rich_markup_mode=None,
     no_args_is_help=True,
     add_completion=False,
 )
 
 channel_app = typer.Typer(
     name="channel",
-    help="Bind, list, log out and delete channel instances (login / list / logout / delete / test).",
+    help=t(
+        "Bind and manage channel instances.\n"
+        "\n"
+        "A channel is one platform instance: one set of credentials, one connection "
+        "and one subject namespace.\n"
+        "\n"
+        "Use `imgw channel login` to create or re-bind a channel (QR scan, silent "
+        "credentials or reconnect), `imgw channel list` to inspect channels, "
+        "`imgw channel logout` to disable one while keeping its data, and "
+        "`imgw channel delete` to remove it (it must be logged out first)."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw channel login feishu --name sales\n"
+        "$ imgw channel list\n"
+        "$ imgw channel logout sales\n"
+        "$ imgw channel delete sales --yes\n"
+    ),
+    rich_markup_mode=None,
     no_args_is_help=True,
 )
 subject_app = typer.Typer(
     name="subject",
-    help="Inspect the known push targets (subjects) of a channel.",
+    help=t(
+        "Inspect the known push targets (subjects).\n"
+        "\n"
+        "A subject is a conversation target -- a direct-message user or a group "
+        "session; the daemon learns subjects from inbound messages."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw subject ls sales\n"
+        "$ imgw subject ls feishu:acme:sales --json\n"
+    ),
+    rich_markup_mode=None,
     no_args_is_help=True,
 )
 config_app = typer.Typer(
     name="config",
-    help="Export, import or locally validate the portable config document.",
+    help=t(
+        "Export, import or validate the config document.\n"
+        "\n"
+        "The database is the single source of truth for a running daemon; "
+        "export/import is the supported way to move configuration between "
+        "environments."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw config export -o cfg.json\n"
+        "$ imgw config import cfg.json\n"
+        "$ imgw config validate cfg.json\n"
+    ),
+    rich_markup_mode=None,
     no_args_is_help=True,
 )
 app.add_typer(channel_app, name="channel")
@@ -118,7 +226,10 @@ def _root(
         typer.Option(
             "--url",
             envvar="IMGW_URL",
-            help="Control-plane URL: http(s)://host:port or unix:///path/to.sock.",
+            help=t(
+                "Control-plane URL: http(s)://host:port or unix:///path/to.sock "
+                "(default: $IMGW_URL, then the daemon's default listen address)."
+            ),
         ),
     ] = None,
     token: Annotated[
@@ -126,12 +237,15 @@ def _root(
         typer.Option(
             "--token",
             envvar="IMGW_TOKEN",
-            help="Control-plane token (default: $IMGW_TOKEN_FILE or the daemon token file).",
+            help=t(
+                "Control-plane bearer token (default: $IMGW_TOKEN, then the file "
+                "named by $IMGW_TOKEN_FILE or the daemon token file)."
+            ),
         ),
     ] = None,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Emit JSON instead of human-readable output."),
+        typer.Option("--json", help=t("Emit JSON (machine-readable) instead of human-readable output.")),
     ] = False,
 ) -> None:
     """Global options shared by every command."""
@@ -304,7 +418,9 @@ def _parse_config_pairs(pairs: list[str] | None) -> dict[str, Any]:
         key, separator, raw = pair.partition("=")
         key = key.strip()
         if not separator or not key:
-            raise typer.BadParameter(f"invalid --config {pair!r}: expected KEY=VALUE")
+            raise typer.BadParameter(
+                t("invalid --config {pair!r}: expected KEY=VALUE", pair=pair)
+            )
         values[key] = _parse_config_value(raw)
     return values
 
@@ -369,11 +485,11 @@ def _emit_service_result(
     for command in commands:
         typer.echo(f"$ {render_command(command)}")
     if dry_run:
-        typer.echo("(dry run: nothing was written or executed)")
+        typer.echo(t("(dry run: nothing was written or executed)"))
         return
     if service_file is not None:
-        typer.echo(f"service definition: {service_file}")
-    typer.echo(f"ok: {len(commands)} command(s) executed")
+        typer.echo(t("service definition: {path}", path=service_file))
+    typer.echo(t("ok: {count} command(s) executed", count=len(commands)))
 
 
 def _wait_ready(ctx: typer.Context, *, timeout_s: float = 30.0) -> None:
@@ -387,11 +503,15 @@ def _wait_ready(ctx: typer.Context, *, timeout_s: float = 30.0) -> None:
         except ControlPlaneError as exc:
             if time.monotonic() >= deadline:
                 raise ServiceError(
-                    f"the daemon did not become ready within {timeout_s:.0f}s: {exc}"
+                    t(
+                        "the daemon did not become ready within {timeout}s: {error}",
+                        timeout=f"{timeout_s:.0f}",
+                        error=exc,
+                    )
                 ) from exc
             time.sleep(0.5)
         else:
-            typer.echo("ready: the daemon answered /readyz")
+            typer.echo(t("ready: the daemon answered /readyz"))
             return
 
 
@@ -400,13 +520,26 @@ def _wait_ready(ctx: typer.Context, *, timeout_s: float = 30.0) -> None:
 # ---------------------------------------------------------------------------
 
 
-@app.command()
+@app.command(
+    help=t(
+        "Show the daemon and library versions: service, octop-gateway and Python "
+        "(`GET /v1/version`). `--json` prints the raw version object."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw version\n"
+        "$ imgw version --json\n"
+    ),
+    short_help=t('Show daemon, octop-gateway and Python versions.'),
+)
 @_handle_errors
 def version(
     ctx: typer.Context,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Emit JSON instead of human-readable output."),
+        typer.Option("--json", help=t("Emit JSON (machine-readable) instead of human-readable output.")),
     ] = False,
 ) -> None:
     """Show the daemon, octop-gateway and Python versions."""
@@ -427,13 +560,27 @@ def version(
             typer.echo(f"{label:16} {value}")
 
 
-@app.command()
+@app.command(
+    help=t(
+        "Show daemon status: service and octop-gateway versions, uptime, database "
+        "and media paths, backend and channel counters, and per-channel state "
+        "(`GET /v1/status`)."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw status\n"
+        "$ imgw status --json\n"
+    ),
+    short_help=t('Show daemon status and per-channel state.'),
+)
 @_handle_errors
 def status(
     ctx: typer.Context,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Emit JSON instead of human-readable output."),
+        typer.Option("--json", help=t("Emit JSON (machine-readable) instead of human-readable output.")),
     ] = False,
 ) -> None:
     """Show daemon status, paths, counters and per-channel state."""
@@ -464,7 +611,21 @@ def status(
         typer.echo(_format_table(CHANNEL_TABLE_HEADERS, rows))
 
 
-@app.command()
+@app.command(
+    help=t(
+        "Probe the daemon's readiness endpoint (`GET /readyz`). Exit code 0 means "
+        "ready; an unreachable or not-ready daemon exits 1, which makes this "
+        "command usable in scripts and behind `imgw start --wait`."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw ready\n"
+        "$ imgw ready && imgw send sales ou_xxx 'the daemon is up'\n"
+    ),
+    short_help=t('Exit 0 when the daemon is ready.'),
+)
 @_handle_errors
 def ready(ctx: typer.Context) -> None:
     """Ask the daemon's /readyz; exit 0 when ready, 1 otherwise."""
@@ -473,22 +634,45 @@ def ready(ctx: typer.Context) -> None:
         try:
             payload = control_plane.api(client, "GET", "/readyz")
         except ControlPlaneError as exc:
-            typer.secho(f"not ready: {exc}", fg=typer.colors.RED, err=True)
+            typer.secho(t("not ready: {error}", error=exc), fg=typer.colors.RED, err=True)
             raise typer.Exit(1) from None
     state = payload.get("status", "ready") if isinstance(payload, dict) else "ready"
-    typer.echo(f"ready: {state}")
+    typer.echo(t("ready: {state}", state=state))
 
 
-@app.command()
+@app.command(
+    help=t(
+        "Push one text message to a subject (`POST /v1/messages`), or broadcast to "
+        "every known subject of the channel with `--all` "
+        "(`POST /v1/messages/broadcast`). A fresh Idempotency-Key is generated for "
+        "every single-subject send. The confirmation line is always English for "
+        "pipe stability: `sent to <channel>/<subject>`."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw send sales ou_xxx 'hello'\n"
+        "$ imgw send sales --all 'maintenance at 22:00'\n"
+        "$ imgw send feishu:acme:sales ou_xxx 'hello' --json\n"
+    ),
+    short_help=t('Push a message to one subject or broadcast.'),
+)
 @_handle_errors
 def send(
     ctx: typer.Context,
-    ref: Annotated[str, typer.Argument(help="channel_id or alias.")],
-    subject_id: Annotated[str | None, typer.Argument(help="Target subject_id (omit with --all).")] = None,
-    text: Annotated[str | None, typer.Argument(help="Message text.")] = None,
+    ref: Annotated[
+        str,
+        typer.Argument(help=t("channel_id or alias of the channel to send through.")),
+    ],
+    subject_id: Annotated[
+        str | None,
+        typer.Argument(help=t("Target subject_id (omit with --all).")),
+    ] = None,
+    text: Annotated[str | None, typer.Argument(help=t("Message text (plain text)."))] = None,
     all_: Annotated[
         bool,
-        typer.Option("--all", help="Broadcast to every known subject of the channel."),
+        typer.Option("--all", help=t("Broadcast to every known subject of the channel.")),
     ] = False,
 ) -> None:
     """Push a text message to one subject, or broadcast with --all."""
@@ -498,7 +682,9 @@ def send(
         # Typer fills positionals left to right.
         broadcast_text = text if text is not None else subject_id
         if not broadcast_text:
-            raise typer.BadParameter("missing TEXT: usage is `imgw send <ref> --all <text>`")
+            raise typer.BadParameter(
+                t("missing TEXT: usage is `imgw send <ref> --all <text>`")
+            )
         with get_client(options.url, options.token) as client:
             payload = control_plane.api(
                 client,
@@ -515,7 +701,10 @@ def send(
 
     if subject_id is None or text is None:
         raise typer.BadParameter(
-            "usage is `imgw send <ref> <subject_id> <text>` or `imgw send <ref> --all <text>`"
+            t(
+                "usage is `imgw send <ref> <subject_id> <text>` or "
+                "`imgw send <ref> --all <text>`"
+            )
         )
     with get_client(options.url, options.token) as client:
         payload = control_plane.api(
@@ -531,23 +720,38 @@ def send(
     typer.echo(f"sent to {ref}/{subject_id}")
 
 
-@app.command()
+@app.command(
+    help=t(
+        "Query the daemon's stored message history (`GET /v1/history`, read-only). "
+        "Both inbound and outbound messages are shown with timestamps, direction "
+        "and a truncated text preview."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw history --limit 20\n"
+        "$ imgw history --channel sales --subject ou_xxx --since 1730000000\n"
+        "$ imgw history --json\n"
+    ),
+    short_help=t('Query stored message history (read-only).'),
+)
 @_handle_errors
 def history(
     ctx: typer.Context,
     channel: Annotated[
         str | None,
-        typer.Option("--channel", help="Filter by channel_id or alias."),
+        typer.Option("--channel", help=t("Filter by channel_id or alias.")),
     ] = None,
-    subject: Annotated[str | None, typer.Option("--subject", help="Filter by subject_id.")] = None,
+    subject: Annotated[str | None, typer.Option("--subject", help=t("Filter by subject_id."))] = None,
     since: Annotated[
         float | None,
-        typer.Option("--since", help="Only messages at/after this epoch timestamp."),
+        typer.Option("--since", help=t("Only messages at/after this epoch timestamp (seconds).")),
     ] = None,
-    limit: Annotated[int, typer.Option("--limit", help="Maximum number of messages.")] = 50,
+    limit: Annotated[int, typer.Option("--limit", help=t("Maximum number of messages to return."))] = 50,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Emit JSON instead of human-readable output."),
+        typer.Option("--json", help=t("Emit JSON (machine-readable) instead of human-readable output.")),
     ] = False,
 ) -> None:
     """Query the daemon's message history (read-only)."""
@@ -567,7 +771,7 @@ def history(
         _print_json({"messages": messages})
         return
     if not messages:
-        typer.echo("(no messages)")
+        typer.echo(t("(no messages)"))
         return
     rows = [
         [
@@ -584,13 +788,27 @@ def history(
     typer.echo(_format_table(HISTORY_TABLE_HEADERS, rows))
 
 
-@app.command()
+@app.command(
+    help=t(
+        "Tail the daemon's SSE event stream (`GET /v1/events`) until Ctrl-C or the "
+        "connection closes. Each stdout line is one JSON event; keepalive comments "
+        "are dropped. Use `--channel` to filter."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw events\n"
+        "$ imgw events --channel sales\n"
+    ),
+    short_help=t('Tail the SSE event stream.'),
+)
 @_handle_errors
 def events(
     ctx: typer.Context,
     channel: Annotated[
         str | None,
-        typer.Option("--channel", help="Only events for this channel_id or alias."),
+        typer.Option("--channel", help=t("Only events for this channel_id or alias.")),
     ] = None,
 ) -> None:
     """Tail the daemon's SSE event stream until Ctrl-C."""
@@ -610,7 +828,11 @@ def events(
                     typer.echo(payload)
     except httpx.TransportError as exc:
         raise ControlPlaneError(
-            f"cannot reach the im-gateway daemon: {exc}. Start it with `imgw run`."
+            t(
+                "cannot reach the im-gateway daemon: {error}. Start it with "
+                "`imgw run`.",
+                error=exc,
+            )
         ) from exc
     except KeyboardInterrupt:
         raise typer.Exit(0) from None
@@ -626,13 +848,27 @@ def _sse_data(line: str) -> str | None:
     return data or None
 
 
-@app.command()
+@app.command(
+    help=t(
+        "Run control-plane self-checks: `/healthz`, `/readyz`, `/v1/version` and "
+        "`/v1/status` are called in order and every result is printed. Exit code 0 "
+        "when all checks pass, 1 otherwise."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw doctor\n"
+        "$ imgw doctor --json\n"
+    ),
+    short_help=t('Run control-plane self-checks.'),
+)
 @_handle_errors
 def doctor(
     ctx: typer.Context,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Emit JSON instead of human-readable output."),
+        typer.Option("--json", help=t("Emit JSON (machine-readable) instead of human-readable output.")),
     ] = False,
 ) -> None:
     """Run control-plane self-checks; exit 1 if any check fails."""
@@ -658,7 +894,7 @@ def doctor(
         for check in checks:
             marker = "ok  " if check["ok"] else "FAIL"
             typer.echo(f"[{marker}] {check['check']}: {check['detail']}")
-        typer.echo("all checks passed" if ok else "doctor found problems")
+        typer.echo(t("all checks passed") if ok else t("doctor found problems"))
     if not ok:
         raise typer.Exit(1)
 
@@ -674,23 +910,63 @@ def _doctor_detail(name: str, payload: Any) -> str:
     return str(payload.get("status", "ok"))
 
 
-@app.command()
+@app.command(
+    help=t(
+        "Start the gateway daemon in the foreground (the production entry point). "
+        "This is the only command that starts a process: it migrates and opens the "
+        "SQLite database, reconciles enabled channels from the database, and serves "
+        "the control plane plus all channel connections in one asyncio loop. Stop "
+        "it with Ctrl-C; for a managed service use `imgw install-service` followed "
+        "by `imgw start`."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw run\n"
+        "$ imgw run --host 127.0.0.1 --port 8765\n"
+    ),
+    short_help=t('Start the gateway daemon (production).'),
+)
 def run(
-    host: Annotated[str, typer.Option("--host", help="Control-plane listen host.")] = "127.0.0.1",
-    port: Annotated[int, typer.Option("--port", help="Control-plane listen port.")] = 8765,
+    host: Annotated[str, typer.Option("--host", help=t("Control-plane listen host."))] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", help=t("Control-plane listen port."))] = 8765,
 ) -> None:
     """Start the gateway daemon in the foreground (the production entry point)."""
     # TODO(milestone-2): also expose --db / --listen once the daemon accepts them.
     _start_daemon(host=host, port=port)
 
 
-@app.command("run-dev")
+@app.command(
+    "run-dev",
+    help=t(
+        "Start the daemon in development mode. On top of a normal run, an "
+        "in-process echo backend (`im_gateway.dev.backend`) listens on "
+        "`--dev-backend-port` and every tenant is routed to it; the `backends` "
+        "table is not modified. The echo backend replies to any inbound message "
+        "with one `message` frame and one `completed` frame listing channel, "
+        "subject, turn and idempotency ids, so channel connectivity can be "
+        "verified without a real webhook."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw run-dev\n"
+        "$ imgw run-dev --port 8765 --dev-backend-port 9900\n"
+        "$ imgw run-dev --host 0.0.0.0 --port 9000\n"
+    ),
+    short_help=t('Start the daemon with the in-process echo backend.'),
+)
 def run_dev(
-    host: Annotated[str, typer.Option("--host", help="Control-plane listen host.")] = "127.0.0.1",
-    port: Annotated[int, typer.Option("--port", help="Control-plane listen port.")] = 8765,
+    host: Annotated[str, typer.Option("--host", help=t("Control-plane listen host."))] = "127.0.0.1",
+    port: Annotated[int, typer.Option("--port", help=t("Control-plane listen port."))] = 8765,
     dev_backend_port: Annotated[
         int,
-        typer.Option("--dev-backend-port", help="Loopback port for the in-process echo backend."),
+        typer.Option(
+            "--dev-backend-port",
+            help=t("Loopback port for the in-process echo backend."),
+        ),
     ] = 9900,
 ) -> None:
     """Start the daemon in dev mode: every tenant is routed to the echo backend.
@@ -708,40 +984,69 @@ def _start_daemon(*, host: str, port: int, **extra: Any) -> None:
     try:
         from im_gateway.gateway.app import run_daemon
     except ImportError as exc:  # pragma: no cover - only when the daemon side is absent
-        typer.secho(f"error: the gateway runtime is not available: {exc}", fg=typer.colors.RED, err=True)
+        typer.secho(
+            f"error: {t('the gateway runtime is not available: {error}', error=exc)}",
+            fg=typer.colors.RED,
+            err=True,
+        )
         raise typer.Exit(1) from None
     run_daemon(host=host, port=port, **extra)
 
 
-@app.command("install-service")
+@app.command(
+    "install-service",
+    help=t(
+        "Generate the platform service definition (`systemd` unit, `launchd` plist "
+        "or NSSM commands) and install/enable it so the OS service manager keeps "
+        "`imgw run` alive. The default is a user-scoped service; `--system` "
+        "installs system-wide (needs root). `--print-only` prints the definition "
+        "without writing or executing anything; `--dry-run` prints the commands "
+        "without running them."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw install-service --print-only\n"
+        "$ imgw install-service --dry-run\n"
+        "$ imgw install-service --system --workdir /srv/im-gateway\n"
+    ),
+    short_help=t('Install the OS service definition.'),
+)
 @_handle_service_errors
 def install_service(
     ctx: typer.Context,
     dry_run: Annotated[
         bool,
-        typer.Option("--dry-run", help="Print the commands without writing files or running them."),
+        typer.Option("--dry-run", help=t("Print the commands without writing files or running them.")),
     ] = False,
     user_scope: Annotated[
         bool,
         typer.Option(
             "--user/--system",
-            help="Install a user-scoped service (default, no root) or a system-wide one (needs root).",
+            help=t(
+                "Install a user-scoped service (default, no root) or a system-wide "
+                "one (needs root)."
+            ),
         ),
     ] = True,
     workdir: Annotated[
         str | None,
-        typer.Option("--workdir", help="Working directory of the daemon (default: the current directory)."),
+        typer.Option(
+            "--workdir",
+            help=t("Working directory of the daemon (default: the current directory)."),
+        ),
     ] = None,
     print_only: Annotated[
         bool,
         typer.Option(
             "--print-only",
-            help="Print the generated definition without writing or executing anything.",
+            help=t("Print the generated definition without writing or executing anything."),
         ),
     ] = False,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Emit JSON instead of human-readable output."),
+        typer.Option("--json", help=t("Emit JSON (machine-readable) instead of human-readable output.")),
     ] = False,
 ) -> None:
     """Generate and install the platform service definition (systemd / launchd / NSSM)."""
@@ -764,24 +1069,40 @@ def install_service(
     )
 
 
-@app.command("uninstall-service")
+@app.command(
+    "uninstall-service",
+    help=t(
+        "Stop and remove the platform service definition installed by "
+        "`imgw install-service`. The default is the user-scoped service; "
+        "`--system` targets the system-wide one."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw uninstall-service\n"
+        "$ imgw uninstall-service --system\n"
+        "$ imgw uninstall-service --dry-run\n"
+    ),
+    short_help=t('Remove the OS service definition.'),
+)
 @_handle_service_errors
 def uninstall_service(
     ctx: typer.Context,
     dry_run: Annotated[
         bool,
-        typer.Option("--dry-run", help="Print the commands without executing them."),
+        typer.Option("--dry-run", help=t("Print the commands without executing them.")),
     ] = False,
     user_scope: Annotated[
         bool,
         typer.Option(
             "--user/--system",
-            help="Manage the user-scoped service (default) or the system-wide one.",
+            help=t("Manage the user-scoped service (default) or the system-wide one."),
         ),
     ] = True,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Emit JSON instead of human-readable output."),
+        typer.Option("--json", help=t("Emit JSON (machine-readable) instead of human-readable output.")),
     ] = False,
 ) -> None:
     """Stop and remove the platform service definition."""
@@ -792,28 +1113,45 @@ def uninstall_service(
     _emit_service_result(ctx, commands, dry_run=dry_run, json_output=json_output)
 
 
-@app.command("start")
+@app.command(
+    "start",
+    help=t(
+        "Start the installed OS service through the platform service manager "
+        "(systemd / launchd / NSSM). `--wait` additionally polls `/readyz` for up "
+        "to 30 seconds and fails if the daemon does not become ready. The default "
+        "is the user-scoped service."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw start\n"
+        "$ imgw start --wait\n"
+        "$ imgw start --system --dry-run\n"
+    ),
+    short_help=t('Start the installed OS service.'),
+)
 @_handle_service_errors
 def start(
     ctx: typer.Context,
     wait: Annotated[
         bool,
-        typer.Option("--wait", help="Poll /readyz until the daemon is ready."),
+        typer.Option("--wait", help=t("Poll /readyz until the daemon is ready.")),
     ] = False,
     dry_run: Annotated[
         bool,
-        typer.Option("--dry-run", help="Print the commands without executing them."),
+        typer.Option("--dry-run", help=t("Print the commands without executing them.")),
     ] = False,
     user_scope: Annotated[
         bool,
         typer.Option(
             "--user/--system",
-            help="Manage the user-scoped service (default) or the system-wide one.",
+            help=t("Manage the user-scoped service (default) or the system-wide one."),
         ),
     ] = True,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Emit JSON instead of human-readable output."),
+        typer.Option("--json", help=t("Emit JSON (machine-readable) instead of human-readable output.")),
     ] = False,
 ) -> None:
     """Start the system service."""
@@ -825,24 +1163,39 @@ def start(
         _wait_ready(ctx)
 
 
-@app.command("stop")
+@app.command(
+    "stop",
+    help=t(
+        "Stop the installed OS service through the platform service manager. The "
+        "default is the user-scoped service; `--system` targets the system-wide "
+        "one."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw stop\n"
+        "$ imgw stop --system\n"
+    ),
+    short_help=t('Stop the installed OS service.'),
+)
 @_handle_service_errors
 def stop(
     ctx: typer.Context,
     dry_run: Annotated[
         bool,
-        typer.Option("--dry-run", help="Print the commands without executing them."),
+        typer.Option("--dry-run", help=t("Print the commands without executing them.")),
     ] = False,
     user_scope: Annotated[
         bool,
         typer.Option(
             "--user/--system",
-            help="Manage the user-scoped service (default) or the system-wide one.",
+            help=t("Manage the user-scoped service (default) or the system-wide one."),
         ),
     ] = True,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Emit JSON instead of human-readable output."),
+        typer.Option("--json", help=t("Emit JSON (machine-readable) instead of human-readable output.")),
     ] = False,
 ) -> None:
     """Stop the system service."""
@@ -852,24 +1205,39 @@ def stop(
     _emit_service_result(ctx, commands, dry_run=dry_run, json_output=json_output)
 
 
-@app.command("restart")
+@app.command(
+    "restart",
+    help=t(
+        "Restart the installed OS service through the platform service manager. "
+        "The default is the user-scoped service; `--system` targets the "
+        "system-wide one."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw restart\n"
+        "$ imgw restart --system\n"
+    ),
+    short_help=t('Restart the installed OS service.'),
+)
 @_handle_service_errors
 def restart(
     ctx: typer.Context,
     dry_run: Annotated[
         bool,
-        typer.Option("--dry-run", help="Print the commands without executing them."),
+        typer.Option("--dry-run", help=t("Print the commands without executing them.")),
     ] = False,
     user_scope: Annotated[
         bool,
         typer.Option(
             "--user/--system",
-            help="Manage the user-scoped service (default) or the system-wide one.",
+            help=t("Manage the user-scoped service (default) or the system-wide one."),
         ),
     ] = True,
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Emit JSON instead of human-readable output."),
+        typer.Option("--json", help=t("Emit JSON (machine-readable) instead of human-readable output.")),
     ] = False,
 ) -> None:
     """Restart the system service."""
@@ -950,7 +1318,7 @@ def _build_login_config(
     if secret_stdin:
         stdin_secret = sys.stdin.readline().strip()
         if not stdin_secret:
-            _fail("--secret-stdin：stdin 上没读到 secret")
+            _fail(t("--secret-stdin: no secret found on stdin"))
     if app_id:
         values["app_id"] = app_id
     if app_secret:
@@ -1007,11 +1375,11 @@ def _write_login_qr_png(challenge: dict[str, Any], path: str) -> None:
 
     text = _login_qr_text(challenge)
     if not text:
-        _fail("后端没有返回二维码内容，无法写出 PNG")
+        _fail(t("the daemon did not return QR content; cannot write the PNG"))
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(render_qr_bytes(text))
-    _stderr(f"QR PNG: {target}")
+    _stderr(t("QR PNG: {path}", path=target))
 
 
 def _stdout_can_encode(text: str, encoding: str | None = None) -> bool:
@@ -1033,14 +1401,19 @@ def _emit_terminal_qr(content: str) -> None:
         return
     # A GBK/cp936 console cannot print half-block characters: keep the URL
     # usable and point at the PNG / URL alternatives instead of crashing.
-    _stderr("(终端编码不支持二维码字符；已改为只输出 URL，可用 --qr-png 生成图片)")
+    _stderr(
+        t(
+            "(this terminal cannot encode QR characters; printing the URL only -- "
+            "use --qr-png for an image)"
+        )
+    )
     typer.echo(content)
 
 
 def _emit_login_challenge(challenge: dict[str, Any], output_format: str) -> None:
     text = _login_qr_text(challenge)
     if not text:
-        _fail("后端没有返回二维码内容")
+        _fail(t("the daemon did not return QR content"))
     if output_format == "json":
         typer.echo(_compact_json({"event": "challenge", **challenge}))
         return
@@ -1076,15 +1449,20 @@ def _qr_login(
         challenge = control_plane.api(client, "POST", path)
         sid = str(challenge.get("session_id") or "")
         if not sid:
-            _fail("daemon 未返回 login session_id")
+            _fail(t("the daemon did not return a login session_id"))
         if qr_png:
             _write_login_qr_png(challenge, qr_png)
         _emit_login_challenge(challenge, output_format)
     sid = str(challenge.get("session_id") or "")
     if not sid:
-        _fail("daemon 未返回 login session_id")
+        _fail(t("the daemon did not return a login session_id"))
     if no_wait:
-        _stderr(f"session: {sid} (resume with --session-id {sid})")
+        _stderr(
+            t(
+                "session: {session_id} (resume with --session-id {session_id})",
+                session_id=sid,
+            )
+        )
         return challenge
     deadline = time.monotonic() + max(0.1, timeout)
     status = str(challenge.get("status") or "pending")
@@ -1094,31 +1472,38 @@ def _qr_login(
         result = control_plane.api(client, "GET", f"{path}/{_ref_path(sid)}")
         next_status = str(result.get("status") or status)
         if next_status != status and output_format != "json":
-            _stderr(f"status: {next_status}")
+            _stderr(t("status: {status}", status=next_status))
         status = next_status
     if status in {"confirmed", "success"}:
         if output_format == "json":
             typer.echo(_compact_json({"event": "result", **result}))
-        _stderr(f"login confirmed: {ref}")
+        _stderr(t("login confirmed: {ref}", ref=ref))
         message = str(result.get("message") or "")
         if message:
-            _stderr(f"warning: {message}")
+            _stderr(t("warning: {message}", message=message))
         return result
     if status in {"pending", "scanned"}:
         with contextlib.suppress(ControlPlaneError):
             control_plane.api(client, "DELETE", f"{path}/{_ref_path(sid)}")
-        _fail(f"login timed out after {timeout:g}s")
+        _fail(t("login timed out after {timeout:g}s", timeout=timeout))
     if output_format == "json":
         typer.echo(_compact_json({"event": "result", **result}))
     message = str(result.get("message") or "")
-    _fail(f"login {status}" + (f": {message}" if message else ""))
+    reason = f": {message}" if message else ""
+    _fail(t("login {status}{reason}", status=status, reason=reason))
 
 
 def _report_logged_in(channel: dict[str, Any], output_format: str) -> None:
     if output_format == "json":
         typer.echo(_compact_json({"event": "result", **channel}))
         return
-    _stderr(f"logged in: {channel.get('channel_id')} ({channel.get('state')})")
+    _stderr(
+        t(
+            "logged in: {channel_id} ({state})",
+            channel_id=channel.get("channel_id"),
+            state=channel.get("state"),
+        )
+    )
 
 
 def _flatten_config(config: dict[str, Any], prefix: str = "config") -> list[tuple[str, str]]:
@@ -1173,76 +1558,175 @@ def _channel_tsv_row(channel: dict[str, Any]) -> list[str]:
     ]
 
 
-@channel_app.command("login")
+@channel_app.command(
+    "login",
+    help=t(
+        "Bind or re-bind a channel instance: scan a QR code, pass credentials "
+        "silently, or reconnect an already-bound channel.\n"
+        "\n"
+        "TARGET is either an existing channel_id/alias to re-bind, or a channel "
+        "kind (feishu/wecom/dingtalk/qq/weixin) to create a new instance.\n"
+        "\n"
+        "Behavior matrix:\n"
+        "\n"
+        "\b\n"
+        "new target, no credentials         QR login (auto-enabled on confirmation)\n"
+        "new target, credential flags       silent registration (no QR, enabled immediately)\n"
+        "existing target, credentials ok    reconnect / re-enable without scanning\n"
+        "existing target, credentials lost  QR login\n"
+        "existing target, credential flags  overwrite credentials, then reconnect\n"
+        "existing target + --rescan         force a fresh QR scan (expired token, new account)\n"
+        "\n"
+        "Per-platform credential flags:\n"
+        "\n"
+        "\b\n"
+        "feishu    --app-id / --app-secret\n"
+        "wecom     --bot-id / --secret\n"
+        "dingtalk  --app-key / --app-secret\n"
+        "qq        --app-id / --secret        (QQ stores the secret as `secret`)\n"
+        "weixin    --token / --account-id / --base-url   (also builds an `accounts` entry)\n"
+        "\n"
+        "Use --secret-stdin to read the secret from stdin instead of argv (keeps it "
+        "out of the process list), --check to probe new credentials before "
+        "registering, and --no-wait to print the QR challenge immediately and "
+        "resume later with --session-id."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "# 1. create a channel by QR scan (prints URL + terminal QR; also writes a PNG)\n"
+        "$ imgw channel login weixin:wx --qr-png ./weixin-qr.png\n"
+        "\n"
+        "\b\n"
+        "# 2. create a channel silently from credentials (no scan)\n"
+        "$ imgw channel login feishu --id feishu:acme:sales --name sales \\\n"
+        "    --app-id cli_xxx --app-secret \"$FEISHU_APP_SECRET\"\n"
+        "\n"
+        "\b\n"
+        "# 3. overwrite the credentials of an existing channel and reconnect\n"
+        "$ imgw channel login feishu:acme:sales --app-id cli_yyy \\\n"
+        "    --app-secret \"$FEISHU_APP_SECRET\"\n"
+        "\n"
+        "\b\n"
+        "# 4. force a fresh scan (e.g. an expired WeChat session)\n"
+        "$ imgw channel login weixin:wx --rescan\n"
+        "\n"
+        "\b\n"
+        "# 5. scripted flow: print the URL and exit, then resume with --session-id\n"
+        "$ imgw channel login weixin:wx --format url --no-wait\n"
+        "$ imgw channel login weixin:wx --session-id abc123 --format json\n"
+    ),
+    short_help=t('Bind or re-bind a channel (QR, credentials, reconnect).'),
+)
 @_handle_errors
 def channel_login(
     ctx: typer.Context,
     target: Annotated[
         str,
         typer.Argument(
-            help=(
-                "Existing channel_id/alias (re-login) or a channel kind "
+            help=t(
+                "Existing channel_id/alias to re-bind, or a channel kind "
                 "(feishu/wecom/dingtalk/qq/weixin) to create a new channel."
             )
         ),
     ],
     channel_id: Annotated[
         str,
-        typer.Option("--id", help="Immutable channel_id for a new channel (default: <kind>:<name>)."),
+        typer.Option(
+            "--id",
+            help=t("Immutable channel_id for a new channel (default: <kind>:<name>)."),
+        ),
     ] = "",
     name: Annotated[
         str,
-        typer.Option("--name", help="Instance name for a new channel (also used as the CLI alias)."),
+        typer.Option(
+            "--name",
+            help=t("Instance name for a new channel (also used as the CLI alias)."),
+        ),
     ] = "",
     tenant: Annotated[
         str | None,
-        typer.Option("--tenant", help="Tenant id (backend routing key) for a new channel."),
+        typer.Option("--tenant", help=t("Tenant id (backend routing key) for a new channel.")),
     ] = None,
     config: Annotated[
         list[str] | None,
-        typer.Option("--config", help="Channel config as KEY=VALUE; repeatable."),
+        typer.Option(
+            "--config",
+            help=t(
+                "Extra channel config as KEY=VALUE; repeatable (values are typed as "
+                "bool/int/string)."
+            ),
+        ),
     ] = None,
-    app_id: Annotated[str, typer.Option("--app-id", help="feishu/qq: app_id.")] = "",
-    app_secret: Annotated[str, typer.Option("--app-secret", help="feishu/qq/dingtalk: app_secret.")] = "",
-    bot_id: Annotated[str, typer.Option("--bot-id", help="wecom: bot_id.")] = "",
-    secret: Annotated[str, typer.Option("--secret", help="wecom: bot secret.")] = "",
-    app_key: Annotated[str, typer.Option("--app-key", help="dingtalk: app_key (client_id).")] = "",
-    token: Annotated[str, typer.Option("--token", help="qq/weixin: bot token.")] = "",
-    account_id: Annotated[str, typer.Option("--account-id", help="weixin: account id.")] = "",
-    base_url: Annotated[str, typer.Option("--base-url", help="weixin: API base URL.")] = "",
+    app_id: Annotated[str, typer.Option("--app-id", help=t("feishu/qq: app_id."))] = "",
+    app_secret: Annotated[
+        str,
+        typer.Option("--app-secret", help=t("feishu/qq/dingtalk: app_secret (QQ stores it as `secret`).")),
+    ] = "",
+    bot_id: Annotated[str, typer.Option("--bot-id", help=t("wecom: bot_id."))] = "",
+    secret: Annotated[str, typer.Option("--secret", help=t("wecom/qq: bot or application secret."))] = "",
+    app_key: Annotated[str, typer.Option("--app-key", help=t("dingtalk: app_key (client_id)."))] = "",
+    token: Annotated[
+        str,
+        typer.Option("--token", help=t("qq: bot token, or weixin: account bot token.")),
+    ] = "",
+    account_id: Annotated[
+        str,
+        typer.Option("--account-id", help=t("weixin: account id (also fills the `accounts` entry).")),
+    ] = "",
+    base_url: Annotated[str, typer.Option("--base-url", help=t("weixin: API base URL."))] = "",
     secret_stdin: Annotated[
         bool,
-        typer.Option("--secret-stdin", help="Read the secret from stdin instead of argv."),
+        typer.Option("--secret-stdin", help=t("Read the secret from stdin instead of argv.")),
     ] = False,
     rescan: Annotated[
         bool,
-        typer.Option("--rescan", help="Force a fresh QR scan even when credentials exist."),
+        typer.Option("--rescan", help=t("Force a fresh QR scan even when credentials exist.")),
     ] = False,
     check: Annotated[
         bool,
-        typer.Option("--check", help="Probe credentials before registering a new channel."),
+        typer.Option("--check", help=t("Probe credentials before registering a new channel.")),
     ] = False,
     output_format: Annotated[
         str,
-        typer.Option("--format", help="QR output: both (default) | url | qr | json."),
+        typer.Option(
+            "--format",
+            help=t(
+                "QR output: both (URL + terminal QR), url (URL only), qr (terminal "
+                "QR only) or json (NDJSON events)."
+            ),
+        ),
     ] = "both",
-    json_output: Annotated[bool, typer.Option("--json", help="Alias for --format json.")] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help=t("Alias for --format json (NDJSON events).")),
+    ] = False,
     qr_png: Annotated[
         str,
-        typer.Option("--qr-png", help="Also write the QR code to this PNG path."),
+        typer.Option("--qr-png", help=t("Also write the QR code to this PNG path.")),
     ] = "",
     timeout: Annotated[
         float,
-        typer.Option("--timeout", help="Overall wait for confirmation (seconds)."),
+        typer.Option("--timeout", help=t("Overall wait for login confirmation (seconds).")),
     ] = 300.0,
-    interval: Annotated[float, typer.Option("--interval", help="Poll interval (seconds).")] = 2.0,
+    interval: Annotated[
+        float,
+        typer.Option("--interval", help=t("Poll interval while waiting for confirmation (seconds).")),
+    ] = 2.0,
     no_wait: Annotated[
         bool,
-        typer.Option("--no-wait", help="Print the challenge and exit; resume with --session-id."),
+        typer.Option(
+            "--no-wait",
+            help=t("Print the challenge and exit; resume with --session-id."),
+        ),
     ] = False,
     session_id: Annotated[
         str,
-        typer.Option("--session-id", help="Resume an existing login session (same channel ref)."),
+        typer.Option(
+            "--session-id",
+            help=t("Resume an existing login session for the same channel ref."),
+        ),
     ] = "",
 ) -> None:
     """Bind or re-bind a channel: QR scan, silent credentials, or reconnect.
@@ -1256,9 +1740,15 @@ def channel_login(
     if _want_json(ctx, json_output):
         output_format = "json"
     if output_format not in _LOGIN_FORMATS:
-        _fail(f"不支持的 --format: {output_format!r}（可选 {'/'.join(_LOGIN_FORMATS)}）")
+        _fail(
+            t(
+                "unsupported --format {value!r}: choose {choices}",
+                value=output_format,
+                choices="/".join(_LOGIN_FORMATS),
+            )
+        )
     if timeout <= 0:
-        _fail("--timeout 必须为正数")
+        _fail(t("--timeout must be a positive number"))
     values = _build_login_config(
         target,
         app_id=app_id,
@@ -1276,7 +1766,7 @@ def channel_login(
         existing = _channel_or_none(client, target)
         if existing is None:
             if session_id:
-                _fail("--session-id 只能用于已存在的通道")
+                _fail(t("--session-id can only be used with an existing channel"))
             alias = name or None
             new_id = channel_id or (f"{target}:{alias}" if alias else f"{target}:{uuid.uuid4().hex[:6]}")
             entry = ChannelConfigEntry(
@@ -1304,7 +1794,12 @@ def channel_login(
             if values:
                 _report_logged_in(created, output_format)
                 return
-            _stderr(f"created {new_id} (disabled until the QR login completes)")
+            _stderr(
+                t(
+                    "created {channel_id} (disabled until the QR login completes)",
+                    channel_id=new_id,
+                )
+            )
             _qr_login(
                 client,
                 new_id,
@@ -1335,8 +1830,12 @@ def channel_login(
         if rescan or configured is False:
             if not existing.get("login_supported"):
                 _fail(
-                    f"通道 {ref!r}（{existing.get('kind')}）不支持扫码登录；"
-                    "请用凭据参数（--app-id/--app-secret 等）直接登录"
+                    t(
+                        "channel {ref!r} ({kind}) does not support QR login; pass "
+                        "credentials instead (--app-id/--app-secret, ...)",
+                        ref=ref,
+                        kind=existing.get("kind"),
+                    )
                 )
             _qr_login(
                 client,
@@ -1361,12 +1860,31 @@ def channel_login(
         _report_logged_in(updated, output_format)
 
 
-@channel_app.command("logout")
+@channel_app.command(
+    "logout",
+    help=t(
+        "Log a channel out: disable it while keeping its credentials, subjects, "
+        "message history and config. This is the old `disable` semantic and is "
+        "idempotent. Re-bind with `imgw channel login <ref>` (no QR scan is needed "
+        "while credentials remain)."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw channel logout sales\n"
+        "$ imgw channel logout feishu:acme:sales --json\n"
+    ),
+    short_help=t('Disable a channel, keeping its data.'),
+)
 @_handle_errors
 def channel_logout(
     ctx: typer.Context,
-    ref: Annotated[str, typer.Argument(help="channel_id or alias.")],
-    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON instead of text.")] = False,
+    ref: Annotated[str, typer.Argument(help=t("channel_id or alias."))],
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help=t("Emit JSON (machine-readable) instead of human-readable output.")),
+    ] = False,
 ) -> None:
     """Log a channel out (disable it), keeping credentials, data and history."""
     options = _options(ctx)
@@ -1381,25 +1899,56 @@ def channel_logout(
         _print_json(payload)
         return
     _stderr(
-        f"logged out: {payload.get('channel_id')} "
-        "(disabled; credentials and history kept)"
+        t(
+            "logged out: {channel_id} (disabled; credentials and history kept)",
+            channel_id=payload.get("channel_id"),
+        )
     )
 
 
-@channel_app.command("list")
+@channel_app.command(
+    "list",
+    help=t(
+        "List channels, or show one channel in detail.\n"
+        "\n"
+        "Without REF: one TSV row per channel with the fixed columns "
+        "`channel_id  kind  state  creds  alias` (a header is printed by default; "
+        "`--no-header` prints bare rows for pipes). Disabled channels are "
+        "included.\n"
+        "\n"
+        "With REF: a `key<TAB>value` detail view, including login support, "
+        "credential status and the masked config (`app_secret` / `token` are always "
+        "`***`; `${ENV}` references are preserved). Secrets never leave the daemon."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw channel list\n"
+        "$ imgw channel list | awk -F'\\t' '$3 == \"running\" {print $1}'\n"
+        "$ imgw channel list --no-header | cut -f1\n"
+        "$ imgw channel list sales\n"
+    ),
+    short_help=t('List channels or show one in detail.'),
+)
 @_handle_errors
 def channel_list(
     ctx: typer.Context,
     ref: Annotated[
         str | None,
-        typer.Argument(help="Optional channel_id/alias to show one channel in detail."),
+        typer.Argument(help=t("Optional channel_id/alias to show one channel in detail.")),
     ] = None,
-    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON instead of TSV.")] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help=t("Emit JSON (machine-readable) instead of TSV.")),
+    ] = False,
     header: Annotated[
         bool,
         typer.Option(
             "--header/--no-header",
-            help="Print the TSV header line (default: on; use --no-header for bare rows).",
+            help=t(
+                "Print the TSV header line (default: on; use --no-header for bare rows)."
+            ),
         ),
     ] = True,
 ) -> None:
@@ -1432,38 +1981,68 @@ def channel_list(
     for channel in channels:
         typer.echo("\t".join(_channel_tsv_row(channel)))
     if not channels:
-        _stderr("(no channels; bind one with `imgw channel login <kind>`)")
+        _stderr(t("(no channels; bind one with `imgw channel login <kind>`)"))
 
 
-@channel_app.command("delete")
+@channel_app.command(
+    "delete",
+    help=t(
+        "Delete a channel row (`DELETE /v1/channels/{ref}`). The channel must be "
+        "logged out first: the daemon rejects deletion of an enabled channel with "
+        "HTTP 409, and the CLI checks before calling. By default `subjects` and "
+        "`messages` are kept; `--purge` deletes them too. `--yes` skips the "
+        "interactive confirmation (required when stdin is not a TTY)."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw channel logout sales\n"
+        "$ imgw channel delete sales --yes\n"
+        "$ imgw channel delete sales --yes --purge\n"
+        "$ imgw channel delete sales --yes --json\n"
+    ),
+    short_help=t('Delete a channel (log it out first).'),
+)
 @_handle_errors
 def channel_delete(
     ctx: typer.Context,
-    ref: Annotated[str, typer.Argument(help="channel_id or alias.")],
+    ref: Annotated[str, typer.Argument(help=t("channel_id or alias."))],
     purge: Annotated[
         bool,
-        typer.Option("--purge", help="Also delete the channel's subjects and messages."),
+        typer.Option("--purge", help=t("Also delete the channel's subjects and messages.")),
     ] = False,
     yes: Annotated[
         bool,
-        typer.Option("--yes", "-y", help="Skip the interactive confirmation."),
+        typer.Option("--yes", "-y", help=t("Skip the interactive confirmation.")),
     ] = False,
-    json_output: Annotated[bool, typer.Option("--json", help="Emit JSON instead of text.")] = False,
+    json_output: Annotated[
+        bool,
+        typer.Option("--json", help=t("Emit JSON (machine-readable) instead of human-readable output.")),
+    ] = False,
 ) -> None:
     """Delete a channel row; the channel must be logged out first."""
     if not yes:
         if not sys.stdin.isatty():
-            _fail("refusing to delete without confirmation; re-run with --yes (stdin is not a TTY)")
-        typer.confirm(f"delete channel {ref!r}?", abort=True)
+            _fail(
+                t(
+                    "refusing to delete without confirmation; re-run with --yes "
+                    "(stdin is not a TTY)"
+                )
+            )
+        typer.confirm(t("delete channel {ref!r}?", ref=ref), abort=True)
     options = _options(ctx)
     with get_client(options.url, options.token) as client:
         current = _channel_or_none(client, ref)
         if current is None:
-            _fail(f"unknown channel: {ref!r}")
+            _fail(t("unknown channel: {ref!r}", ref=ref))
         if current.get("enabled"):
             _fail(
-                f"channel {current.get('channel_id')!r} is still logged in; "
-                f"run `imgw channel logout {current.get('channel_id')}` first"
+                t(
+                    "channel {channel_id!r} is still logged in; run "
+                    "`imgw channel logout {channel_id}` first",
+                    channel_id=current.get("channel_id"),
+                )
             )
         payload = control_plane.api(
             client,
@@ -1478,14 +2057,33 @@ def channel_delete(
     _stderr(f"deleted: {payload.get('channel_id')} ({detail})")
 
 
-@channel_app.command("test")
+@channel_app.command(
+    "test",
+    help=t(
+        "Probe channel credentials without registering a channel: the daemon "
+        "starts a temporary instance, validates the credentials and tears it down "
+        "(`POST /v1/channels/probe`). Use it before a silent `channel login` or "
+        "when debugging bad credentials."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw channel test feishu --config app_id=cli_xxx --config app_secret=\"$FEISHU_APP_SECRET\"\n"
+        "$ imgw channel test wecom --config bot_id=\"$WECOM_BOT_ID\" --config secret=\"$WECOM_SECRET\"\n"
+    ),
+    short_help=t('Probe credentials without registering.'),
+)
 @_handle_errors
 def channel_test(
     ctx: typer.Context,
-    kind: Annotated[str, typer.Argument(help="Channel kind to probe, e.g. feishu.")],
+    kind: Annotated[str, typer.Argument(help=t("Channel kind to probe, e.g. feishu."))],
     config: Annotated[
         list[str] | None,
-        typer.Option("--config", help="Channel config as KEY=VALUE; repeatable."),
+        typer.Option(
+            "--config",
+            help=t("Channel config as KEY=VALUE; repeatable."),
+        ),
     ] = None,
 ) -> None:
     """Probe credentials without registering a channel."""
@@ -1513,14 +2111,30 @@ def channel_test(
 # ---------------------------------------------------------------------------
 
 
-@subject_app.command("ls")
+@subject_app.command(
+    "ls",
+    help=t(
+        "List the known push targets (subjects) of a channel "
+        "(`GET /v1/channels/{ref}/subjects`). Subjects are learned from inbound "
+        "messages; each row shows subject_id, chat_type, display_name, first_seen "
+        "and last_seen."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw subject ls sales\n"
+        "$ imgw subject ls feishu:acme:sales --json\n"
+    ),
+    short_help=t("List a channel's known push targets."),
+)
 @_handle_errors
 def subject_ls(
     ctx: typer.Context,
-    ref: Annotated[str, typer.Argument(help="channel_id or alias.")],
+    ref: Annotated[str, typer.Argument(help=t("channel_id or alias."))],
     json_output: Annotated[
         bool,
-        typer.Option("--json", help="Emit JSON instead of human-readable output."),
+        typer.Option("--json", help=t("Emit JSON (machine-readable) instead of human-readable output.")),
     ] = False,
 ) -> None:
     """List the known push targets (subjects) of a channel."""
@@ -1533,7 +2147,7 @@ def subject_ls(
         _print_json({"subjects": subjects})
         return
     if not subjects:
-        typer.echo("(no known subjects yet)")
+        typer.echo(t("(no known subjects yet)"))
         return
     rows = [
         [
@@ -1553,17 +2167,35 @@ def subject_ls(
 # ---------------------------------------------------------------------------
 
 
-@config_app.command("export")
+@config_app.command(
+    "export",
+    help=t(
+        "Export the portable config document as JSON (`GET /v1/config/export`). "
+        "Secrets are masked by default: literal secrets become `***`, while "
+        "`${ENV}` references stay as-is. `--with-secrets` includes literal secrets "
+        "(handle the output carefully); `-o/--output` writes a file instead of "
+        "stdout."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw config export\n"
+        "$ imgw config export -o cfg.json\n"
+        "$ imgw config export --with-secrets -o cfg.secret.json\n"
+    ),
+    short_help=t('Export the config document (secrets masked).'),
+)
 @_handle_errors
 def config_export(
     ctx: typer.Context,
     output: Annotated[
         Path | None,
-        typer.Option("--output", "-o", help="Write the document to this file instead of stdout."),
+        typer.Option("--output", "-o", help=t("Write the document to this file instead of stdout.")),
     ] = None,
     with_secrets: Annotated[
         bool,
-        typer.Option("--with-secrets", help="Include literal secrets instead of masking them."),
+        typer.Option("--with-secrets", help=t("Include literal secrets instead of masking them.")),
     ] = False,
 ) -> None:
     """Export the portable config document (secrets masked by default)."""
@@ -1578,25 +2210,48 @@ def config_export(
     try:
         output.write_text(rendered, encoding="utf-8")
     except OSError as exc:
-        typer.secho(f"error: cannot write {output}: {exc}", fg=typer.colors.RED, err=True)
+        typer.secho(
+            f"error: {t('cannot write {path}: {error}', path=output, error=exc)}",
+            fg=typer.colors.RED,
+            err=True,
+        )
         raise typer.Exit(1) from None
-    typer.echo(f"exported config to {output}")
+    typer.echo(t("exported config to {path}", path=output))
 
 
-@config_app.command("import")
+@config_app.command(
+    "import",
+    help=t(
+        "Validate and import a config document (`POST /v1/config/import`) as a "
+        "single daemon-side transaction: an invalid document changes nothing. "
+        "Masked values (`***`) in the file mean 'keep the current value'."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw config import cfg.json\n"
+        "$ imgw --json config import cfg.json\n"
+    ),
+    short_help=t('Import a config document in one transaction.'),
+)
 @_handle_errors
 def config_import(
     ctx: typer.Context,
     file: Annotated[
         Path,
-        typer.Argument(exists=True, dir_okay=False, readable=True, help="Config document to import."),
+        typer.Argument(exists=True, dir_okay=False, readable=True, help=t("Config document to import.")),
     ],
 ) -> None:
     """Validate and import a config document in one daemon-side transaction."""
     try:
         document = ConfigDocument.model_validate_json(file.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        typer.secho(f"error: invalid config document {file}: {exc}", fg=typer.colors.RED, err=True)
+        typer.secho(
+            f"error: {t('invalid config document {path}: {error}', path=file, error=exc)}",
+            fg=typer.colors.RED,
+            err=True,
+        )
         raise typer.Exit(1) from None
     options = _options(ctx)
     with get_client(options.url, options.token) as client:
@@ -1619,22 +2274,45 @@ def config_import(
     )
 
 
-@config_app.command("validate")
+@config_app.command(
+    "validate",
+    help=t(
+        "Validate a config document locally against the pydantic schema; no daemon "
+        "is required. Useful in CI and pre-commit hooks."
+    ),
+    epilog=t(
+        "Examples:\n"
+        "\n"
+        "\b\n"
+        "$ imgw config validate cfg.json\n"
+        "$ imgw config export -o cfg.json && imgw config validate cfg.json\n"
+    ),
+    short_help=t('Validate a config document locally.'),
+)
 def config_validate(
     file: Annotated[
         Path,
-        typer.Argument(exists=True, dir_okay=False, readable=True, help="Config document to validate."),
+        typer.Argument(exists=True, dir_okay=False, readable=True, help=t("Config document to validate.")),
     ],
 ) -> None:
     """Validate a config document locally (no daemon required)."""
     try:
         document = ConfigDocument.model_validate_json(file.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
-        typer.secho(f"error: invalid config document {file}: {exc}", fg=typer.colors.RED, err=True)
+        typer.secho(
+            f"error: {t('invalid config document {path}: {error}', path=file, error=exc)}",
+            fg=typer.colors.RED,
+            err=True,
+        )
         raise typer.Exit(1) from None
     typer.echo(
-        f"config OK: {len(document.channels)} channel(s), "
-        f"{len(document.backends)} backend(s), {len(document.settings)} setting(s)"
+        t(
+            "config OK: {channels} channel(s), {backends} backend(s), "
+            "{settings} setting(s)",
+            channels=len(document.channels),
+            backends=len(document.backends),
+            settings=len(document.settings),
+        )
     )
 
 

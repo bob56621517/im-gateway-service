@@ -11,6 +11,9 @@ Responsibilities of this module:
 * resolve the bearer token (``--token`` > ``IMGW_TOKEN`` > token file);
 * turn HTTP/transport failures into :class:`ControlPlaneError`, a message the
   CLI can print verbatim (the server's ``{"detail": ...}`` is preserved).
+
+User-facing prose is translated through :func:`im_gateway.cli.i18n.t`; the
+English string is the message id, so English output is unchanged.
 """
 
 from __future__ import annotations
@@ -22,6 +25,7 @@ from typing import Any
 
 import httpx
 
+from im_gateway.cli.i18n import t
 from im_gateway.core import paths
 
 __all__ = [
@@ -38,8 +42,8 @@ __all__ = [
 DEFAULT_URL = "http://127.0.0.1:8765"
 DEFAULT_TIMEOUT = 10.0
 
-_START_HINT = "start it with `imgw run` (or check --url / IMGW_URL)"
-_TOKEN_HINT = (
+_START_HINT = t("start it with `imgw run` (or check --url / IMGW_URL)")
+_TOKEN_HINT = t(
     "no control-plane token found; start the daemon with `imgw run` so it creates "
     "the token file, or pass --token / set IMGW_TOKEN"
 )
@@ -108,10 +112,21 @@ def resolve_token(token: str | None = None) -> str:
         stored = token_file.read_text(encoding="utf-8").strip()
     except OSError as exc:
         raise ControlPlaneError(
-            f"cannot read control-plane token {token_file}: {exc}. {_TOKEN_HINT}"
+            t(
+                "cannot read control-plane token {path}: {error}. {hint}",
+                path=token_file,
+                error=exc,
+                hint=_TOKEN_HINT,
+            )
         ) from exc
     if not stored:
-        raise ControlPlaneError(f"control-plane token file {token_file} is empty. {_TOKEN_HINT}")
+        raise ControlPlaneError(
+            t(
+                "control-plane token file {path} is empty. {hint}",
+                path=token_file,
+                hint=_TOKEN_HINT,
+            )
+        )
     return stored
 
 
@@ -137,7 +152,9 @@ def build_client(
     if base_url.startswith("unix://"):
         socket_path = base_url[len("unix://") :]
         if not socket_path:
-            raise ControlPlaneError("invalid control-plane URL: unix:// address has no socket path")
+            raise ControlPlaneError(
+                t("invalid control-plane URL: unix:// address has no socket path")
+            )
         base_url = "http://localhost"
         transport = httpx.HTTPTransport(uds=socket_path)
     return httpx.Client(
@@ -175,7 +192,12 @@ def api(
         )
     except httpx.TransportError as exc:
         raise ControlPlaneError(
-            f"cannot reach the im-gateway daemon at {client.base_url}: {exc}. {_START_HINT}"
+            t(
+                "cannot reach the im-gateway daemon at {url}: {error}. {hint}",
+                url=client.base_url,
+                error=exc,
+                hint=_START_HINT,
+            )
         ) from exc
     return decode_response(response)
 
@@ -186,7 +208,13 @@ def decode_response(response: httpx.Response) -> Any:
         detail = _error_detail(response)
         request = response.request
         raise ControlPlaneError(
-            f"{request.method} {request.url.path} failed with HTTP {response.status_code}: {detail}",
+            t(
+                "{method} {path} failed with HTTP {status}: {detail}",
+                method=request.method,
+                path=request.url.path,
+                status=response.status_code,
+                detail=detail,
+            ),
             status_code=response.status_code,
             detail=detail,
         )
@@ -196,8 +224,11 @@ def decode_response(response: httpx.Response) -> Any:
         return response.json()
     except ValueError as exc:
         raise ControlPlaneError(
-            f"daemon returned a non-JSON body for {response.request.url.path}: "
-            f"{response.text[:200]!r}"
+            t(
+                "daemon returned a non-JSON body for {path}: {body}",
+                path=response.request.url.path,
+                body=response.text[:200],
+            )
         ) from exc
 
 
